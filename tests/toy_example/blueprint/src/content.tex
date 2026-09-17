@@ -1,0 +1,45 @@
+\chapter{A toy example}
+
+\begin{definition}[Property $A$]\label{def:A}\lean{Toy.A}
+  For every $n$, $A(n)$ states that $n + 1 \le n + 2$.
+\end{definition}
+
+\begin{definition}[Property $B$]\label{def:B}\lean{Toy.B}
+  For every $n$, $B(n)$ states that $n + 2 \le n + 3$.
+\end{definition}
+
+\begin{lemma}\label{lem:lemma1}\lean{Toy.lemma1}\leanok
+  For every $n$, $A(n)$ holds.
+  \uses{def:A}
+\end{lemma}
+
+\begin{proof}
+  Trivial by arithmetic.
+\end{proof}
+
+\begin{lemma}\label{lem:lemma2}\lean{Toy.lemma2}\leanok
+  For every $n$, $A(n+1)$ holds.
+  \uses{def:A}
+\end{lemma}
+
+\begin{proof}
+  Also trivial.
+\end{proof}
+
+\begin{lemma}\label{lem:lemma3}\lean{Toy.lemma3}\leanok
+  For every $n$, $A(n) \wedge B(n+1)$ holds.
+  \uses{def:B}
+\end{lemma}
+
+\begin{proof}
+  Just use lemma2.
+\end{proof}
+
+\begin{lemma}\label{lem:main}\lean{Toy.main}\leanok
+  For every $n$, $A(n) \wedge B(n+1)$ holds.
+  \uses{lem:lemma1,lem:lemma3}
+\end{lemma}
+
+\begin{proof}
+  Easy from lemma1 and lemma3.
+\end{proof}

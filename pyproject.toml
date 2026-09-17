@@ -1,0 +1,27 @@
+[project]
+name = "proofquest"
+version = "0.1.0"
+description = "Deterministic generator of Lean 4 games (GameSkeleton) from leanblueprint projects"
+readme = "README.md"
+authors = [
+    { name = "M3zzinho", email = "gustavo.mezzovilla@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+proofquest = "proofquest.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
