@@ -9,6 +9,7 @@ blocks, or exotic notations in signatures.
 from __future__ import annotations
 
 import re
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 
 from .game_model import LeanDecl
@@ -20,10 +21,6 @@ _EXCLUDED_DIRS = {
     "docbuild",
     "blueprint",
     "home_page",
-    "proofquest",
-    # generated game output: must never be re-read as project source
-    "game",
-    "atlas",
 }
 
 _DECL_RE = re.compile(
@@ -82,7 +79,9 @@ class LeanParseError(Exception):
     pass
 
 
-def _parse_file(path: Path) -> list[LeanDecl]:
+def _parse_file(
+    path: Path, project_modules: AbstractSet[str] = frozenset()
+) -> list[LeanDecl]:
     lines = path.read_text(encoding="utf-8").splitlines()
     decls: list[LeanDecl] = []
     ns_stack: list[tuple[str, str | None]] = []  # (kind, name)
@@ -97,8 +96,7 @@ def _parse_file(path: Path) -> list[LeanDecl]:
         stripped = line.strip()
         if stripped.startswith("import "):
             module = stripped.removeprefix("import ").strip()
-            # Skip project-internal imports; keep only external (Mathlib, etc.)
-            if not module.startswith("BanachSteinhausSokalProof") and module != "LeanAtlas":
+            if module not in project_modules:
                 file_imports.append(module)
             i += 1
             continue
@@ -164,12 +162,19 @@ def parse_project(project_dir: Path, exclude: tuple[Path, ...] = ()) -> dict[str
     project_dir = project_dir.resolve()
     excluded = tuple(path.resolve() for path in exclude)
     decls: dict[str, LeanDecl] = {}
+    source_files: list[Path] = []
     for path in sorted(project_dir.rglob("*.lean")):
         if any(path.is_relative_to(directory) for directory in excluded):
             continue
         relative_parts = path.relative_to(project_dir).parts
         if any(part in _EXCLUDED_DIRS for part in relative_parts):
             continue
-        for decl in _parse_file(path):
+        source_files.append(path)
+    project_modules = {
+        ".".join(path.relative_to(project_dir).with_suffix("").parts)
+        for path in source_files
+    }
+    for path in source_files:
+        for decl in _parse_file(path, project_modules):
             decls[decl.full_name] = decl
     return decls
