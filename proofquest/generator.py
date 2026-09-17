@@ -420,6 +420,11 @@ def build_game(
                 f"(\\lean{{{', '.join(node.lean_names) or '?'}}})"
             )
         world_id = _camel(node.chapter)
+        if world_id in worlds and worlds[world_id].title != node.chapter:
+            raise GenerationError(
+                f"chapter titles {worlds[world_id].title!r} and {node.chapter!r} "
+                f"generate the same world identifier {world_id!r}"
+            )
         if world_id not in worlds:
             intro_tex = blueprint.chapter_intros.get(node.chapter, "")
             worlds[world_id] = World(

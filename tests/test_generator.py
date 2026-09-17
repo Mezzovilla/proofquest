@@ -1,11 +1,15 @@
-from proofquest.game_model import LeanDecl
+import pytest
+
+from proofquest.game_model import Blueprint, BlueprintNode, LeanDecl
 from proofquest.generator import (
+    GenerationError,
     _binder_names,
     _is_declared_theorem,
     _looks_like_theorem_name,
     _resolve_project_decl,
     _strip_accessor_suffix,
     _theorem_refs_in_proof,
+    build_game,
 )
 
 MAX_GT_MEAN_PROOF = """
@@ -174,3 +178,61 @@ def test_resolve_project_decl_finds_namespaced_theorem():
     )
     assert _resolve_project_decl("lemma2", lemma3, decls) is lemma2
     assert _resolve_project_decl("le_max_left", lemma3, decls) is None
+
+
+def _node(label, chapter, order):
+    return BlueprintNode(
+        kind="theorem",
+        label=label,
+        lean_names=[label],
+        title=None,
+        statement_tex="",
+        proof_tex=None,
+        uses=[],
+        leanok=True,
+        chapter=chapter,
+        section=None,
+        order=order,
+    )
+
+
+def test_build_game_rejects_distinct_chapters_with_same_world_id():
+    blueprint = Blueprint(
+        nodes=[_node("first", "A B", 0), _node("second", "A-B", 1)],
+        chapters=["A B", "A-B"],
+    )
+    decls = {
+        "first": _decl(name="first", full_name="first"),
+        "second": _decl(name="second", full_name="second"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.19.0", title="Test")
+
+    message = str(exc_info.value)
+    assert "A B" in message
+    assert "A-B" in message
+    assert "AB" in message
+
+
+def test_build_game_reuses_same_chapter_and_keeps_non_conflicting_worlds():
+    blueprint = Blueprint(
+        nodes=[
+            _node("first", "A B", 0),
+            _node("second", "A B", 1),
+            _node("third", "Different", 2),
+        ],
+        chapters=["A B", "Different"],
+    )
+    decls = {
+        label: _decl(name=label, full_name=label)
+        for label in ("first", "second", "third")
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.19.0", title="Test")
+
+    assert [(world.world_id, world.title) for world in game.worlds] == [
+        ("AB", "A B"),
+        ("Different", "Different"),
+    ]
+    assert [len(world.levels) for world in game.worlds] == [2, 1]
