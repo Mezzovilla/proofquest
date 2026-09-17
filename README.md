@@ -12,7 +12,7 @@ LaTeX write-up.
 
 > **New to proofquest?** The end-to-end guide for any leanblueprint project —
 > check, generate, build, serve — lives in
-> [`proofquest-guide.md`](../proofquest-guide.md).
+> [`proofquest-guide.md`](documents/proofquest-guide.md).
 
 ## How it works
 
