@@ -146,6 +146,109 @@ def test_dir_names_atlas_game_proofquest_are_scanned(tmp_path):
     assert "proofquest_value" in decls
 
 
+ROOT_SOURCE = """namespace IsCyclotomicExtension.Rat.Three
+
+lemma helper : True := trivial
+
+lemma _root_.IsPrimitiveRoot.lambda_prime : True := trivial
+
+end IsCyclotomicExtension.Rat.Three
+
+namespace Solution
+
+noncomputable
+def _root_.Solution'_final : Nat where
+  a := 1
+  b := 2
+
+lemma _root_.Solution'_final_multiplicity : Solution'_final = Solution'_final := rfl
+
+end Solution
+"""
+
+
+def test_root_qualified_declarations(tmp_path):
+    path = tmp_path / "Root.lean"
+    path.write_text(ROOT_SOURCE, encoding="utf-8")
+    decls = {d.full_name: d for d in _parse_file(path)}
+    assert set(decls) == {
+        "IsCyclotomicExtension.Rat.Three.helper",
+        "IsPrimitiveRoot.lambda_prime",
+        "Solution'_final",
+        "Solution'_final_multiplicity",
+    }
+    prime = decls["IsPrimitiveRoot.lambda_prime"]
+    assert prime.namespace == "IsPrimitiveRoot"
+    assert prime.name == "lambda_prime"
+    assert "_root_" not in prime.full_name
+    final = decls["Solution'_final"]
+    assert final.namespace == ""
+    assert final.name == "Solution'_final"
+    assert "_root_" not in final.full_name
+    mult = decls["Solution'_final_multiplicity"]
+    assert mult.namespace == ""
+    assert "_root_" not in mult.full_name
+
+
+def test_standalone_modifier_is_part_of_source_text(tmp_path):
+    path = tmp_path / "Root.lean"
+    path.write_text(ROOT_SOURCE, encoding="utf-8")
+    decls = {d.full_name: d for d in _parse_file(path)}
+    final = decls["Solution'_final"]
+    assert final.source_text.startswith("noncomputable\ndef _root_.Solution'_final")
+    assert "b := 2" in final.source_text
+    helper = decls["IsCyclotomicExtension.Rat.Three.helper"]
+    assert helper.source_text == "lemma helper : True := trivial"
+
+
+def test_structures_in_section(tmp_path):
+    path = tmp_path / "Structures.lean"
+    path.write_text(
+        "namespace Toy\n\nsection Solution'\n\n"
+        "lemma before : True := trivial\n\n"
+        "structure Solution' where\n"
+        "  (a : Nat)\n"
+        "  (b : Nat)\n"
+        "  (H : a + b = 3)\n\n"
+        "structure Solution extends Solution' where\n"
+        "  (hab : a ≤ b)\n\n"
+        "lemma after : True := trivial\n\n"
+        "end Solution'\n\nend Toy\n",
+        encoding="utf-8",
+    )
+    decls = {d.full_name: d for d in _parse_file(path)}
+    assert decls["Toy.Solution'"].keyword == "structure"
+    assert decls["Toy.Solution'"].is_definition
+    assert decls["Toy.Solution'"].proof is None
+    assert "(H : a + b = 3)" in decls["Toy.Solution'"].signature
+    assert "before" not in decls["Toy.Solution'"].source_text
+    assert decls["Toy.Solution"].keyword == "structure"
+    assert "extends Solution' where" in decls["Toy.Solution"].signature
+    assert "(hab : a ≤ b)" in decls["Toy.Solution"].signature
+    assert decls["Toy.before"].proof == "trivial"
+    assert decls["Toy.after"].proof == "trivial"
+
+
+def test_render_defs_root_qualified(tmp_path):
+    path = tmp_path / "Root.lean"
+    path.write_text(ROOT_SOURCE, encoding="utf-8")
+    decls = {d.full_name: d for d in _parse_file(path)}
+    game = Game(
+        title="Test Game",
+        intro_md="",
+        languages="English",
+        worlds=[],
+        definitions=[(decls["Solution'_final"], None)],
+        tactics=[],
+        theorems=[],
+        toolchain="",
+    )
+    rendered = _render_defs(game)
+    assert "noncomputable\ndef _root_.Solution'_final" in rendered
+    assert 'DefinitionDoc Solution\'_final as "Solution\'_final"' in rendered
+    assert "namespace Solution" not in rendered
+
+
 def test_no_special_case_for_fixture_project_names(tmp_path):
     consumer = tmp_path / "Consumer.lean"
     consumer.write_text(

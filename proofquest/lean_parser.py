@@ -26,13 +26,18 @@ _EXCLUDED_DIRS = {
 _DECL_RE = re.compile(
     r"^(?:@\[[^\]]*\]\s*)?"
     r"(?:(?:private|protected|noncomputable|partial|scoped)\s+)*"
-    r"(def|theorem|lemma|abbrev|instance)\s+([A-Za-z_][\w'.]*)",
+    r"(def|theorem|lemma|abbrev|instance|structure)\s+([A-Za-z_][\w'.]*)",
+)
+
+_MODIFIER_LINE_RE = re.compile(
+    r"(?:private|protected|noncomputable|partial|scoped)\s*"
 )
 
 _BOUNDARY_RE = re.compile(
     r"^(?:@\[|/--|--|namespace\b|end\b|section\b|open\b|variable\b|import\b|"
+    r"(?:private|protected|noncomputable|partial|scoped)\s*$|"
     r"(?:(?:private|protected|noncomputable|partial|scoped)\s+)*"
-    r"(?:def|theorem|lemma|abbrev|instance|example)\b)"
+    r"(?:def|theorem|lemma|abbrev|instance|structure|example)\b)"
 )
 
 _OPEN, _CLOSE = "([{⟨", ")]}⟩"
@@ -54,6 +59,7 @@ def _split_signature(decl_text: str, keyword: str, name: str) -> tuple[str, str 
     depth = 0
     i = 0
     skip_next_assign = False  # skip `:=` belonging to a `let` in the signature
+    has_where_body = False
     while i < len(rest):
         ch = rest[i]
         if ch in _OPEN:
@@ -64,10 +70,16 @@ def _split_signature(decl_text: str, keyword: str, name: str) -> tuple[str, str 
             i += 1
             while i < len(rest) and rest[i] != '"':
                 i += 2 if rest[i] == "\\" else 1
+        elif depth == 0 and rest.startswith("where", i) and (
+            i == 0 or not (rest[i - 1].isalnum() or rest[i - 1] in "_.'")
+        ) and (i + 5 >= len(rest) or not (rest[i + 5].isalnum() or rest[i + 5] in "_.'")):
+            has_where_body = True
         elif depth == 0 and rest[i:i+3] == "let" and (i + 3 >= len(rest) or not rest[i+3].isalnum() and rest[i+3] != "_"):
             skip_next_assign = True
         elif depth == 0 and rest.startswith(":=", i):
-            if skip_next_assign:
+            if has_where_body:
+                pass
+            elif skip_next_assign:
                 skip_next_assign = False
             else:
                 return rest[:i].strip(), rest[i + 2:].strip()
@@ -125,23 +137,44 @@ def _parse_file(
             i += 1
             continue
 
-        match = _DECL_RE.match(line)
-        if match and not line[:1].isspace():
+        match = _DECL_RE.match(line) if not line[:1].isspace() else None
+        header = i
+        if match is None and _MODIFIER_LINE_RE.fullmatch(stripped):
+            k = i
+            while (
+                k + 1 < len(lines)
+                and _MODIFIER_LINE_RE.fullmatch(lines[k + 1].strip())
+            ):
+                k += 1
+            if (
+                k + 1 < len(lines)
+                and not lines[k + 1][:1].isspace()
+                and _DECL_RE.match(lines[k + 1])
+            ):
+                header = k + 1
+                match = _DECL_RE.match(lines[header])
+        if match:
             keyword, name = match.group(1), match.group(2)
-            j = i + 1
+            j = header + 1
             while j < len(lines):
                 nxt = lines[j]
                 if nxt.strip() and not nxt[:1].isspace() and _BOUNDARY_RE.match(nxt):
                     break
                 j += 1
             block = "\n".join(lines[i:j]).rstrip()
-            namespace = ".".join(n for kind, n in ns_stack if kind == "ns" and n)
-            signature, proof = _split_signature(block, keyword, name)
+            if name.startswith("_root_."):
+                resolved = name.removeprefix("_root_.")
+                namespace, _, name = resolved.rpartition(".")
+                full_name = resolved
+            else:
+                namespace = ".".join(n for kind, n in ns_stack if kind == "ns" and n)
+                full_name = f"{namespace}.{name}" if namespace else name
+            signature, proof = _split_signature(block, keyword, match.group(2))
             decls.append(
                 LeanDecl(
                     keyword=keyword,
                     name=name,
-                    full_name=f"{namespace}.{name}" if namespace else name,
+                    full_name=full_name,
                     namespace=namespace,
                     signature=signature,
                     proof=proof,
