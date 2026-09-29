@@ -1,4 +1,4 @@
-"""Tests for the ``check`` command's flexible input resolution."""
+"""Tests for the ``check``/``generate`` commands' shared input resolution."""
 
 from pathlib import Path
 
@@ -133,8 +133,131 @@ def test_check_validation_artifacts_rooted_at_project(tmp_path, capsys):
     assert "web not built" not in err
 
 
-def test_generate_still_requires_content_tex(tmp_path, capsys):
-    """`generate` keeps its project-root + src/content.tex interface."""
-    project = make_project(tmp_path, entry="src/web.tex")
+def make_flt3_project(tmp_path: Path) -> Path:
+    """FLT3-style project: web.tex + print.tex -> main.tex -> chapters/chapter.tex."""
+    project = tmp_path / "proj"
+    src = project / "blueprint" / "src"
+    (src / "chapters").mkdir(parents=True)
+    (project / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+    (project / "Basic.lean").write_text(
+        "theorem foo : True :=\n  trivial\n"
+        "theorem web_mark : True :=\n  trivial\n"
+        "theorem print_mark : True :=\n  trivial\n",
+        encoding="utf-8",
+    )
+    (src / "web.tex").write_text(
+        "\\chapter{A toy example}\n"
+        "\\begin{lemma}\\label{lem:web}\\lean{web_mark}\\leanok\n  Web only.\n"
+        "\\end{lemma}\n"
+        "\\begin{proof}\n  By trivial.\n\\end{proof}\n"
+        "\\input{main}\n",
+        encoding="utf-8",
+    )
+    (src / "print.tex").write_text(
+        "\\input{main}\n"
+        "\\begin{lemma}\\label{lem:print}\\lean{print_mark}\\leanok\n  Print only.\n"
+        "\\end{lemma}\n"
+        "\\begin{proof}\n  By trivial.\n\\end{proof}\n",
+        encoding="utf-8",
+    )
+    (src / "main.tex").write_text("\\input{chapters/chapter}\n", encoding="utf-8")
+    (src / "chapters" / "chapter.tex").write_text(
+        "\\begin{lemma}\\label{lem:foo}\\lean{foo}\\leanok\n  Foo holds.\n"
+        "\\end{lemma}\n"
+        "\\begin{proof}\n  By trivial.\n\\end{proof}\n",
+        encoding="utf-8",
+    )
+    (project / "blueprint" / "lean_decls").write_text("foo\n", encoding="utf-8")
+    (project / "blueprint" / "web").mkdir()
+    (project / "blueprint" / "web" / "index.html").write_text("", encoding="utf-8")
+    return project
+
+
+def _level_stems(game_dir: Path) -> set[str]:
+    return {
+        path.name for path in (game_dir / "Game" / "Levels").glob("*/L*_*.lean")
+    }
+
+
+def _assert_root_anchored_game(game_dir: Path) -> None:
+    game_lean = (game_dir / "Game.lean").read_text(encoding="utf-8")
+    assert 'Title "proj"' in game_lean
+    toolchain = (game_dir / "lean-toolchain").read_text(encoding="utf-8").strip()
+    assert toolchain == "leanprover/lean4:v4.31.0"
+
+
+def test_generate_project_root_prefers_web(tmp_path):
+    project = make_flt3_project(tmp_path)
+    game = tmp_path / "game_root"
+    assert main(["generate", str(project), "-o", str(game)]) == 0
+    stems = _level_stems(game)
+    assert "L01_web_mark.lean" in stems
+    assert any(stem.endswith("_foo.lean") for stem in stems)
+    assert not any("print_mark" in stem for stem in stems)
+    _assert_root_anchored_game(game)
+
+
+def test_generate_blueprint_directory(tmp_path, capsys):
+    project = make_flt3_project(tmp_path)
+    game = tmp_path / "game_blueprint"
+    assert main(["generate", str(project / "blueprint"), "-o", str(game)]) == 0
+    stems = _level_stems(game)
+    assert "L01_web_mark.lean" in stems
+    assert not any("print_mark" in stem for stem in stems)
+    _assert_root_anchored_game(game)
+    err = capsys.readouterr().err
+    assert "lean_decls not found" not in err
+    assert "web not built" not in err
+
+
+def test_generate_explicit_print_tex(tmp_path, capsys):
+    project = make_flt3_project(tmp_path)
+    game = tmp_path / "game_print"
+    print_tex = project / "blueprint" / "src" / "print.tex"
+    assert main(["generate", str(print_tex), "-o", str(game)]) == 0
+    stems = _level_stems(game)
+    assert any(stem.endswith("_print_mark.lean") for stem in stems)
+    assert any(stem.endswith("_foo.lean") for stem in stems)
+    assert not any("web_mark" in stem for stem in stems)
+    _assert_root_anchored_game(game)
+    err = capsys.readouterr().err
+    assert "lean_decls not found" not in err
+    assert "web not built" not in err
+
+
+def test_generate_missing_entry_point_is_actionable(tmp_path, capsys):
+    project = make_flt3_project(tmp_path)
+    src = project / "blueprint" / "src"
+    (src / "web.tex").unlink()
+    (src / "print.tex").unlink()
+    (src / "main.tex").unlink()
     assert main(["generate", str(project), "-o", str(tmp_path / "game")]) == 1
-    assert "not found" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "no blueprint entry point" in err
+    assert "explicitly" in err
+
+
+def test_generate_ambiguous_directory_entry(tmp_path, capsys):
+    project = make_flt3_project(tmp_path)
+    (project / "blueprint" / "web.tex").write_text(CONTENT, encoding="utf-8")
+    assert main(["generate", str(project), "-o", str(tmp_path / "game")]) == 1
+    err = capsys.readouterr().err
+    assert "ambiguous" in err
+    assert "explicitly" in err
+
+
+def test_generate_explicit_tex_outside_blueprint(tmp_path, capsys):
+    stray = tmp_path / "stray.tex"
+    stray.write_text(CONTENT, encoding="utf-8")
+    assert main(["generate", str(stray), "-o", str(tmp_path / "game")]) == 1
+    assert "blueprint/" in capsys.readouterr().err
+
+
+def test_generate_root_content_tex_still_works(tmp_path):
+    project = make_project(tmp_path)
+    game = tmp_path / "game"
+    assert main(["generate", str(project), "-o", str(game)]) == 0
+    assert (game / "Game.lean").exists()
+    assert any(stem.endswith("_foo.lean") for stem in _level_stems(game))

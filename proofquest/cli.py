@@ -60,8 +60,8 @@ def _find_entry_point(blueprint_dir: Path) -> Path:
     )
 
 
-def _resolve_check_target(path: Path) -> tuple[Path, Path]:
-    """Resolve a ``check`` argument to ``(project_root, entry_point.tex)``.
+def _resolve_blueprint_target(path: Path) -> tuple[Path, Path]:
+    """Resolve a ``check``/``generate`` argument to ``(project_root, entry_point.tex)``.
 
     Accepted forms: the Lean project root (containing ``blueprint/``), the
     ``blueprint/`` directory itself, or an explicit ``.tex`` file located
@@ -106,7 +106,7 @@ def _default_title(project_dir: Path) -> str:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    project_dir, source = _resolve_check_target(Path(args.project))
+    project_dir, source = _resolve_blueprint_target(Path(args.project))
     blueprint, decls = _load(project_dir, source=source)
     errors, warnings = validate(project_dir, blueprint, decls)
     try:
@@ -123,9 +123,9 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
-    project_dir = Path(args.project)
+    project_dir, source = _resolve_blueprint_target(Path(args.project))
     output_dir = Path(args.output)
-    blueprint, decls = _load(project_dir, (output_dir,))
+    blueprint, decls = _load(project_dir, (output_dir,), source=source)
     errors, warnings = validate(project_dir, blueprint, decls)
 
     toolchain_file = project_dir / "lean-toolchain"
@@ -167,7 +167,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     gen = sub.add_parser("generate", help="generate the game from a blueprint project")
-    gen.add_argument("project", help="path to the Lean project containing blueprint/")
+    gen.add_argument(
+        "project",
+        help="path to the Lean project, its blueprint/ directory, or an "
+        "explicit blueprint .tex entry point",
+    )
     gen.add_argument("-o", "--output", required=True, help="output directory for the game")
     gen.add_argument("--title", default=None, help="game title (default: project folder name)")
     gen.add_argument("--lang", default="en", help="game language code (default: en)")
