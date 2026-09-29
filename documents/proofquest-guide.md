@@ -21,7 +21,10 @@ The three commands, in order:
 proofquest reads a [leanblueprint](https://github.com/PatrickMassot/leanblueprint/)
 project:
 
-- `blueprint/src/content.tex` — the write-up. Each claim is an environment
+- `blueprint/src/content.tex` — the write-up. If your blueprint uses a
+  different entry point (e.g. FLT3-style `web.tex`/`print.tex`), `check`
+  accepts the `blueprint/` directory or an explicit `.tex` file — see
+  `proofquest check` below. Each claim is an environment
   (`definition`, `lemma`, `theorem`, `proposition`, `corollary`) with:
   - `\label{...}` — the blueprint-wide identifier;
   - `\lean{Name}` — the matching Lean declaration. Every environment needs one
@@ -103,10 +106,24 @@ client and server cannot drift.
 
 ## Command options
 
-### `proofquest check PROJECT`
+### `proofquest check TARGET`
 
 Validates and prints the topological order of the blueprint graph. Exit code 1
-on errors.
+on errors. `TARGET` may be:
+
+- the Lean project root (the directory containing `blueprint/`),
+- the `blueprint/` directory itself, or
+- an explicit `.tex` entry point inside `blueprint/` (e.g.
+  `blueprint/src/print.tex`), parsed with recursive `\input` resolution.
+
+For the directory forms the entry point is chosen deterministically:
+`content.tex` > `web.tex` > `print.tex` > `main.tex`, looked up under
+`blueprint/src/` first and then `blueprint/` itself (`src/content.tex` is
+always preferred). No match — or the same non-`content.tex` name in both
+places — is an error asking for an explicit `.tex` file. Whatever the form,
+Lean scanning and the `blueprint/lean_decls` / `blueprint/web` checks are
+always rooted at the enclosing project. `generate`, by contrast, only accepts
+the project root and always reads `blueprint/src/content.tex`.
 
 ### `proofquest generate PROJECT -o GAME_DIR`
 
