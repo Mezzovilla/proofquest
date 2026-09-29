@@ -57,7 +57,7 @@ class LeanDecl:
 
     @property
     def is_definition(self) -> bool:
-        return self.keyword in ("def", "abbrev", "instance")
+        return self.keyword in ("def", "abbrev", "instance", "structure")
 
 
 @dataclass
