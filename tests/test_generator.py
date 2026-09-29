@@ -215,6 +215,266 @@ def test_build_game_rejects_distinct_chapters_with_same_world_id():
     assert "AB" in message
 
 
+def _def_node(label, lean_names, order, uses=()):
+    return BlueprintNode(
+        kind="definition",
+        label=label,
+        lean_names=list(lean_names),
+        title=None,
+        statement_tex=f"Statement of {label}.",
+        proof_tex=None,
+        uses=list(uses),
+        leanok=True,
+        chapter="Ch",
+        section=None,
+        order=order,
+    )
+
+
+def _theorem_node(label, order, uses=()):
+    node = _node(label, "Ch", order)
+    node.lean_names = [label.removeprefix("lem:")]
+    node.uses = list(uses)
+    return node
+
+
+def test_grouped_definition_copies_all_names_once():
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:AB", ["Toy.A", "Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:AB"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.A": _decl(keyword="def", name="A", full_name="Toy.A", namespace="Toy",
+                       source_text="def A : Nat :=\n  1"),
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+                       source_text="def B : Nat :=\n  A"),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Toy.A", "Toy.B"]
+    assert [node.label for _, node in game.definitions] == ["def:AB", "def:AB"]
+    level = game.worlds[0].levels[0]
+    assert [d.full_name for d in level.new_definitions] == ["Toy.A", "Toy.B"]
+
+
+def test_grouped_definition_missing_name_is_error():
+    blueprint = Blueprint(
+        nodes=[_def_node("def:AB", ["Toy.A", "Toy.nope"], 0)],
+        chapters=["Ch"],
+    )
+    decls = {"Toy.A": _decl(keyword="def", name="A", full_name="Toy.A")}
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "Toy.nope" in message
+    assert "def:AB" in message
+
+
+def test_definition_without_lean_fails_generation():
+    blueprint = Blueprint(nodes=[_def_node("def:none", [], 0)], chapters=["Ch"])
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, {}, toolchain="v4.31.0", title="T")
+    assert "no matching Lean declaration" in str(exc_info.value)
+
+
+def test_definition_dependencies_are_copied_first():
+    """A copied definition's project-local deps land in Defs.lean before it."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.A": _decl(keyword="def", name="A", full_name="Toy.A", namespace="Toy",
+                       source_text="def A : Nat :=\n  1"),
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+                       source_text="def B : Nat :=\n  A + 1"),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Toy.A", "Toy.B"]
+    assert game.definitions[0][1] is None
+    level = game.worlds[0].levels[0]
+    assert [d.full_name for d in level.new_definitions] == ["Toy.A", "Toy.B"]
+
+
+def test_definition_depending_on_blueprint_theorem_is_error():
+    """A copied def referencing a blueprint theorem would dangle in
+    Defs.lean (the theorem becomes a `Statement` level, not a copied decl);
+    it must fail loudly, naming the definition label and the theorem."""
+    helper = _theorem_node("lem:helper", 1)
+    helper.lean_names = ["helper_lemma"]
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            helper,
+            _theorem_node("lem:t", 2, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+                       source_text="def B : Nat :=\n  if helper_lemma then 1 else 2"),
+        "helper_lemma": _decl(name="helper_lemma", full_name="helper_lemma",
+                              proof="by trivial"),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "def:b" in message
+    assert "helper_lemma" in message
+    assert "Toy.B" in message
+    assert "\\uses" not in message
+
+
+def test_definition_transitive_blueprint_theorem_dep_is_error():
+    """The same failure must fire through an intermediate copied decl."""
+    helper = _theorem_node("lem:helper", 1)
+    helper.lean_names = ["helper_lemma"]
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            helper,
+            _theorem_node("lem:t", 2, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+                       source_text="def B : Nat :=\n  mid"),
+        "Toy.mid": _decl(keyword="def", name="mid", full_name="Toy.mid",
+                         namespace="Toy",
+                         source_text="def mid : Nat :=\n  helper_lemma"),
+        "helper_lemma": _decl(name="helper_lemma", full_name="helper_lemma",
+                              proof="by trivial"),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "def:b" in message
+    assert "helper_lemma" in message
+    assert "Toy.mid" in message
+    assert "\\uses" not in message
+
+
+def test_source_refs_resolve_root_qualified_names():
+    """`_root_.Foo.bar` in source resolves to the `Foo.bar` decl key."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.A": _decl(keyword="def", name="A", full_name="Toy.A", namespace="Toy",
+                       source_text="def A : Nat :=\n  1"),
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+                       source_text="def B : Nat :=\n  _root_.Toy.A + 1"),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Toy.A", "Toy.B"]
+
+
+def test_source_refs_ignore_string_literals_and_local_binders():
+    """Identifiers inside string literals or bound by let/fun in the body are
+    not dependencies, even if a project decl happens to share their name."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            source_text=(
+                'def B : String :=\n'
+                '  let msg := "Uses fake_dep and other_dep"\n'
+                '  msg'
+            ),
+        ),
+        "Toy.fake_dep": _decl(keyword="def", name="fake_dep",
+                              full_name="Toy.fake_dep", namespace="Toy",
+                              source_text="def fake_dep : Nat :=\n  0"),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Toy.B"]
+
+
+def test_shared_listed_decl_doc_goes_to_first_node_in_order():
+    """A decl listed by two definition nodes is documented by the first one
+    in topological order, even when copied earlier as a dependency."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:early", ["Toy.early"], 0),
+            _def_node("def:shared1", ["Toy.shared"], 1),
+            _def_node("def:shared2", ["Toy.shared"], 2),
+            _theorem_node("lem:t", 3, uses=["def:early"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.early": _decl(keyword="def", name="early", full_name="Toy.early",
+                           namespace="Toy",
+                           source_text="def early : Nat :=\n  shared"),
+        "Toy.shared": _decl(keyword="def", name="shared", full_name="Toy.shared",
+                            namespace="Toy",
+                            source_text="def shared : Nat :=\n  1"),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    by_name = {decl.full_name: node for decl, node in game.definitions}
+    assert list(by_name) == ["Toy.shared", "Toy.early"]
+    assert by_name["Toy.shared"].label == "def:shared1"
+
+
+def test_theorem_docs_require_in_category_on_legacy_game_server():
+    """v4.7.0 GameServer rejects `TheoremDoc t as "t"` without `in "cat"`."""
+    from proofquest.game_model import Game
+    from proofquest.generator import _render_theorem_docs
+
+    def game(toolchain):
+        return Game(
+            title="T", intro_md="", languages="en", worlds=[],
+            definitions=[], tactics=[], theorems=["le_max_left"],
+            toolchain=toolchain,
+        )
+
+    legacy = _render_theorem_docs(game("leanprover/lean4:v4.7.0"))
+    assert 'TheoremDoc le_max_left as "le_max_left" in "Theorems"' in legacy
+    modern = _render_theorem_docs(game("leanprover/lean4:v4.31.0"))
+    assert 'TheoremDoc le_max_left as "le_max_left"' in modern
+    assert 'in "Theorems"' not in modern
+
+
 def test_build_game_reuses_same_chapter_and_keeps_non_conflicting_worlds():
     blueprint = Blueprint(
         nodes=[

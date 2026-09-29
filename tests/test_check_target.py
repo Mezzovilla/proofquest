@@ -24,6 +24,38 @@ def make_project(tmp_path: Path, entry: str = "src/content.tex") -> Path:
     return project
 
 
+def test_check_warns_on_definition_without_lean(tmp_path, capsys):
+    """A definition with no \\lean{} warns (like a theorem), exit stays 0."""
+    project = make_project(tmp_path)
+    src = project / "blueprint" / "src"
+    (src / "content.tex").write_text(
+        CONTENT
+        + "\\begin{definition}\\label{def:missing}\\leanok\n"
+        "  A definition with a commented-out \\lean.\n\\end{definition}\n",
+        encoding="utf-8",
+    )
+    assert main(["check", str(project)]) == 0
+    err = capsys.readouterr().err
+    assert "def:missing" in err
+    assert "definition has no \\lean{} declaration" in err
+
+
+def test_generate_fails_on_definition_without_lean(tmp_path, capsys):
+    """The same project must fail `generate` with an actionable error."""
+    project = make_project(tmp_path)
+    src = project / "blueprint" / "src"
+    (src / "content.tex").write_text(
+        CONTENT
+        + "\\begin{definition}\\label{def:missing}\\leanok\n"
+        "  A definition with a commented-out \\lean.\n\\end{definition}\n",
+        encoding="utf-8",
+    )
+    assert main(["generate", str(project), "-o", str(tmp_path / "game")]) == 1
+    err = capsys.readouterr().err
+    assert "def:missing" in err
+    assert "no matching Lean declaration" in err
+
+
 def test_check_project_root_content_tex(tmp_path):
     project = make_project(tmp_path)
     assert main(["check", str(project)]) == 0
