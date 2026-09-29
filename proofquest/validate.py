@@ -22,7 +22,7 @@ def validate(
                 errors.append(
                     f"{node.label}: \\lean{{{lean_name}}} not found in the Lean sources"
                 )
-        if node.is_theorem and not node.lean_names:
+        if not node.lean_names:
             warnings.append(f"{node.label}: {node.kind} has no \\lean{{}} declaration")
 
     lean_decls_file = project_dir / "blueprint" / "lean_decls"

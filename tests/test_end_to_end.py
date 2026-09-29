@@ -69,6 +69,23 @@ def test_defs_are_copied_verbatim(generated):
     assert "theorem" not in defs  # theorems must NOT leak into the game
 
 
+def test_legacy_toolchain_emits_v4_7_doc_syntax(tmp_path):
+    """GameServer < v4.23.0: `DefinitionDoc` takes no `in` clause and
+    `TheoremDoc` mandates `in "category"` (verified against v4.7.0 sources;
+    a docstring plus a trailing content string is rejected, so the docstring
+    is kept and no content string is emitted)."""
+    out = tmp_path / "game_legacy"
+    assert main(
+        ["generate", str(PROJECT), "-o", str(out),
+         "--toolchain", "leanprover/lean4:v4.7.0"]
+    ) == 0
+    defs = (out / "Game/Generated/Defs.lean").read_text()
+    assert 'DefinitionDoc Toy.A as "A"' in defs
+    assert 'DefinitionDoc Toy.A as "A" in' not in defs
+    level1 = (out / "Game/Levels/AToyExample/L01_lemma1.lean").read_text()
+    assert 'TheoremDoc Toy.lemma1 as "lemma1" in "A toy example"' in level1
+
+
 def test_deterministic_output(generated, tmp_path):
     again = tmp_path / "game2"
     assert main(["generate", str(PROJECT), "-o", str(again), "--title", "Toy Game"]) == 0

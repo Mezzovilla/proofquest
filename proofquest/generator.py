@@ -298,6 +298,82 @@ def _resolve_project_decl(
     return None
 
 
+def _source_refs(decl: LeanDecl, decls: dict[str, LeanDecl]) -> list[LeanDecl]:
+    """Project-local declarations referenced anywhere in ``decl``'s source.
+
+    A definition copied into ``Defs.lean`` may itself mention other
+    project declarations (in its type, body or ``variable`` context); those
+    must be copied along or the file will not elaborate. Same resolution
+    rules as ``_theorem_refs_in_proof``: identifier candidates are filtered
+    against locally bound names and resolved through ``decl``'s own
+    namespace/opens via :func:`_resolve_project_decl`.
+    """
+    text = _strip_lean_comments(decl.source_text)
+    text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+    bound = _binder_names(decl.signature)
+    bound |= _proof_bound_names(text)
+    for var_line in decl.variables:
+        bound |= _binder_names(var_line)
+    text += "\n" + "\n".join(decl.variables)
+    bound.add(decl.name)
+    bound.add(decl.full_name)
+    refs: list[LeanDecl] = []
+    seen: set[str] = set()
+    for match in _IDENT_RE.finditer(text):
+        name = _strip_accessor_suffix(match.group(0))
+        if name.strip("_") == "":
+            continue
+        head = name.split(".", 1)[0]
+        if head in _KNOWN_TACTICS or head in _TERM_KEYWORDS or head in _LEAN_KEYWORDS:
+            continue
+        if head in bound or name in seen:
+            continue
+        seen.add(name)
+        dep = _resolve_project_decl(name.removeprefix("_root_."), decl, decls)
+        if dep is not None and dep is not decl:
+            refs.append(dep)
+    return refs
+
+
+def _copy_order(
+    roots: list[LeanDecl],
+    decls: dict[str, LeanDecl],
+    blueprint_theorems: set[str],
+    label: str,
+) -> list[LeanDecl]:
+    """``roots`` plus their transitive project-local dependencies, deps first.
+
+    Deterministic: dependencies are visited in the order they are referenced
+    in each declaration's source text. Names in ``blueprint_theorems`` are
+    blueprint *theorem* declarations: they become game levels via `Statement`
+    and can never be copied into ``Defs.lean`` (the duplicate name would
+    clash with the level's own declaration), so depending on one — directly
+    or transitively — is a :class:`GenerationError` rather than a silently
+    dangling reference.
+    """
+    ordered: list[LeanDecl] = []
+    seen: set[str] = set()
+
+    def visit(decl: LeanDecl) -> None:
+        if decl.full_name in seen:
+            return
+        seen.add(decl.full_name)
+        for dep in _source_refs(decl, decls):
+            if dep.full_name in blueprint_theorems:
+                raise GenerationError(
+                    f"{label}: copied declaration {decl.full_name} depends on "
+                    f"blueprint theorem {dep.full_name}, which becomes a game "
+                    "level and cannot be copied into Defs.lean; restate that "
+                    "dependency in the source as a project definition"
+                )
+            visit(dep)
+        ordered.append(decl)
+
+    for root in roots:
+        visit(root)
+    return ordered
+
+
 def _looks_like_theorem_name(name: str) -> bool:
     """Best-effort naming-convention check for an *external* (e.g. Mathlib)
     theorem reference that cannot be checked against source.
@@ -337,6 +413,25 @@ def _is_declared_theorem(name: str, decl: LeanDecl, decls: dict[str, LeanDecl]) 
 
 class GenerationError(Exception):
     pass
+
+
+def _legacy_doc_syntax(toolchain: str) -> bool:
+    """Whether the GameServer at ``toolchain`` needs the pre-v4.23 doc syntax.
+
+    lean4game tags before ``v4.23.0`` (e.g. ``v4.7.0``) require
+    ``TheoremDoc NAME as "display" in "category" ["content"]`` — the ``in``
+    clause is mandatory — while ``DefinitionDoc`` accepts only
+    ``NAME as "display" ["content"]`` (no ``in`` clause at all). From
+    ``v4.23.0`` the ``in`` clause is optional on every doc command, so the
+    shorter forms are kept there unchanged. Verified against the real
+    v4.7.0 GameServer: a docstring *and* a trailing content string together
+    are rejected, so content strings are never emitted (the docstring is
+    kept instead).
+    """
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", toolchain)
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2))) < (4, 23)
 
 
 def _camel(title: str) -> str:
@@ -390,19 +485,48 @@ def build_game(
                 return decls[name]
         return None
 
-    definitions: list[tuple[LeanDecl, BlueprintNode | None]] = []
-    def_by_label: dict[str, LeanDecl] = {}
+    theorem_names = {
+        name for node in order if node.is_theorem for name in node.lean_names
+    }
+    def_node_by_name: dict[str, BlueprintNode] = {}
     for node in order:
         if node.is_theorem:
             continue
-        decl = node_decl(node)
-        if decl is None:
+        for name in node.lean_names:
+            if name in decls and name not in def_node_by_name:
+                def_node_by_name[name] = node
+
+    definitions: list[tuple[LeanDecl, BlueprintNode | None]] = []
+    def_closure_by_label: dict[str, list[LeanDecl]] = {}
+    emitted_defs: set[str] = set()
+    for node in order:
+        if node.is_theorem:
+            continue
+        missing = [name for name in node.lean_names if name not in decls]
+        if not node.lean_names or missing:
             raise GenerationError(
                 f"{node.label}: definition has no matching Lean declaration "
                 f"(\\lean{{{', '.join(node.lean_names) or '?'}}})"
+                + (
+                    f"; not found in the Lean sources: {', '.join(missing)}"
+                    if missing
+                    else ""
+                )
             )
-        definitions.append((decl, node))
-        def_by_label[node.label] = decl
+        named = [decls[name] for name in node.lean_names]
+        named_names = {d.full_name for d in named}
+        copied = _copy_order(named, decls, theorem_names, node.label)
+        for dep in copied:
+            if dep.full_name in emitted_defs:
+                continue
+            emitted_defs.add(dep.full_name)
+            owner = (
+                node
+                if dep.full_name in named_names
+                else def_node_by_name.get(dep.full_name)
+            )
+            definitions.append((dep, owner))
+        def_closure_by_label[node.label] = copied
 
     worlds: dict[str, World] = {}
     world_order: list[str] = []
@@ -438,9 +562,12 @@ def build_game(
         new_defs: list[LeanDecl] = []
         for use in node.uses:
             used = by_label.get(use)
-            if used is not None and not used.is_theorem and use not in introduced_defs:
-                introduced_defs.add(use)
-                new_defs.append(def_by_label[use])
+            if used is None or used.is_theorem:
+                continue
+            for dep in def_closure_by_label[use]:
+                if dep.is_definition and dep.full_name not in introduced_defs:
+                    introduced_defs.add(dep.full_name)
+                    new_defs.append(dep)
 
         new_tactics: list[str] = []
         new_theorems: list[str] = []
@@ -713,8 +840,15 @@ def _render_theorem_docs(game: Game) -> str:
     # These are external (e.g. Mathlib) theorems referenced by sample proofs,
     # so there is no local docstring to reuse: link to the mathlib doc page.
     parts = ["import GameServer.Commands"]
+    legacy = _legacy_doc_syntax(game.toolchain)
     for theorem in game.theorems:
-        parts.append(f'/-- [[mathlib_doc]] -/\nTheoremDoc {theorem} as "{theorem}"')
+        if legacy:
+            parts.append(
+                f"/-- [[mathlib_doc]] -/\n"
+                f'TheoremDoc {theorem} as "{theorem}" in "Theorems"'
+            )
+        else:
+            parts.append(f'/-- [[mathlib_doc]] -/\nTheoremDoc {theorem} as "{theorem}"')
     return "\n\n".join(parts) + "\n"
 
 
