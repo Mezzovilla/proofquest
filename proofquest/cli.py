@@ -15,11 +15,83 @@ from .toolchain import game_toolchain
 from .validate import validate
 
 
-def _load(project_dir: Path, exclude: tuple[Path, ...] = ()):
-    content_tex = project_dir / "blueprint" / "src" / "content.tex"
+def _load(project_dir: Path, exclude: tuple[Path, ...] = (), source: Path | None = None):
+    content_tex = (
+        source
+        if source is not None
+        else project_dir / "blueprint" / "src" / "content.tex"
+    )
     blueprint = parse_blueprint(content_tex)
     decls = parse_project(project_dir, exclude)
     return blueprint, decls
+
+
+_ENTRY_POINT_NAMES = ("content.tex", "web.tex", "print.tex", "main.tex")
+
+
+def _find_entry_point(blueprint_dir: Path) -> Path:
+    """Pick the conventional ``.tex`` entry point inside a blueprint directory.
+
+    Candidates are looked up under ``blueprint/src`` and ``blueprint`` itself,
+    trying each name of :data:`_ENTRY_POINT_NAMES` in order. ``src/content.tex``
+    wins unconditionally (existing behaviour); for any other name, finding it
+    in *both* locations is ambiguous and raises a :class:`BlueprintError`
+    instead of picking one arbitrarily.
+    """
+    for name in _ENTRY_POINT_NAMES:
+        candidates = [
+            path
+            for path in (blueprint_dir / "src" / name, blueprint_dir / name)
+            if path.is_file()
+        ]
+        if not candidates:
+            continue
+        if name != "content.tex" and len(candidates) > 1:
+            raise BlueprintError(
+                f"ambiguous blueprint entry point {name}: found both "
+                f"{candidates[0]} and {candidates[1]}; "
+                "pass the intended .tex file explicitly"
+            )
+        return candidates[0]
+    raise BlueprintError(
+        f"no blueprint entry point found in {blueprint_dir}: looked for "
+        + ", ".join(f"src/{name} or {name}" for name in _ENTRY_POINT_NAMES)
+        + "; pass the .tex entry point explicitly"
+    )
+
+
+def _resolve_check_target(path: Path) -> tuple[Path, Path]:
+    """Resolve a ``check`` argument to ``(project_root, entry_point.tex)``.
+
+    Accepted forms: the Lean project root (containing ``blueprint/``), the
+    ``blueprint/`` directory itself, or an explicit ``.tex`` file located
+    inside a ``blueprint/`` directory. In every case the enclosing Lean
+    project root is what gets scanned for Lean declarations.
+    """
+    if path.is_file():
+        entry = path.resolve()
+        if entry.suffix != ".tex":
+            raise BlueprintError(
+                f"not a .tex entry point: {path}; pass the blueprint's .tex file"
+            )
+        for ancestor in entry.parents:
+            if ancestor.name == "blueprint":
+                return ancestor.parent, entry
+        raise BlueprintError(
+            f"{path} is not inside a blueprint/ directory; "
+            "pass a .tex entry point within the project's blueprint/"
+        )
+    if path.is_dir():
+        if (path / "blueprint").is_dir():
+            return path, _find_entry_point(path / "blueprint")
+        if path.name == "blueprint":
+            return path.parent, _find_entry_point(path)
+        raise BlueprintError(
+            f"{path} is not a Lean project (no blueprint/ subdirectory) "
+            "nor a blueprint/ directory; pass the project root, its "
+            "blueprint/ directory, or an explicit .tex entry point"
+        )
+    raise BlueprintError(f"project path not found: {path}")
 
 
 def _report(errors: list[str], warnings: list[str]) -> None:
@@ -34,8 +106,8 @@ def _default_title(project_dir: Path) -> str:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    project_dir = Path(args.project)
-    blueprint, decls = _load(project_dir)
+    project_dir, source = _resolve_check_target(Path(args.project))
+    blueprint, decls = _load(project_dir, source=source)
     errors, warnings = validate(project_dir, blueprint, decls)
     try:
         order = topological_order(blueprint)
@@ -103,7 +175,11 @@ def main(argv: list[str] | None = None) -> int:
     gen.set_defaults(func=cmd_generate)
 
     chk = sub.add_parser("check", help="validate blueprint against the Lean sources")
-    chk.add_argument("project", help="path to the Lean project containing blueprint/")
+    chk.add_argument(
+        "project",
+        help="path to the Lean project, its blueprint/ directory, or an "
+        "explicit blueprint .tex entry point",
+    )
     chk.set_defaults(func=cmd_check)
 
     srv = sub.add_parser(

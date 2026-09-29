@@ -16,8 +16,10 @@ LaTeX write-up.
 
 ## How it works
 
-1. **Blueprint parsing** — `blueprint/src/content.tex` (following `\input`) is
-   parsed for `definition`/`lemma`/`theorem`/`proposition`/`corollary`
+1. **Blueprint parsing** — the blueprint entry point (`blueprint/src/content.tex`
+   by default; `check` also accepts the `blueprint/` directory or an explicit
+   `.tex` file — see below) is parsed following `\input` for
+   `definition`/`lemma`/`theorem`/`proposition`/`corollary`
    environments with their `\label`, `\lean{}`, `\uses{}` and `proof` blocks.
 2. **Lean parsing** — the project's `.lean` sources are scanned: `def`s are
    copied verbatim into the game, `theorem` signatures are extracted and the
@@ -33,15 +35,28 @@ LaTeX write-up.
 
 ## Usage
 
+Validate the blueprint against the Lean sources. The `check` argument may be
+the project root, its `blueprint/` directory, or an explicit `.tex` entry
+point inside `blueprint/`; `generate` takes the project root:
+
 ```bash
 uv sync
 
 # Validate the blueprint against the Lean sources
 uv run proofquest check /path/to/project
+uv run proofquest check /path/to/project/blueprint
+uv run proofquest check /path/to/project/blueprint/src/print.tex
 
 # Generate the game
 uv run proofquest generate /path/to/project -o /path/to/game --title "My Game"
 ```
+
+When `check` is given a project root or a `blueprint/` directory, it picks the
+entry point deterministically: `content.tex`, `web.tex`, `print.tex`,
+`main.tex` — in that order — under `blueprint/src/` first, then `blueprint/`
+itself (`src/content.tex` always wins). If no conventional name exists, or the
+same non-`content.tex` name exists in both places, `check` fails and asks for
+an explicit `.tex` file. `generate` always uses `blueprint/src/content.tex`.
 
 Then build the game (requires a lean4game-compatible toolchain, tags `v4.X.0`):
 
