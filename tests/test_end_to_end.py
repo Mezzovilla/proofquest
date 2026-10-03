@@ -86,6 +86,70 @@ def test_legacy_toolchain_emits_v4_7_doc_syntax(tmp_path):
     assert 'TheoremDoc Toy.lemma1 as "lemma1" in "A toy example"' in level1
 
 
+def _write_rejection_project(project: Path, lean_source: str) -> None:
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        "\\chapter{C}\n"
+        "\\begin{definition}\\label{def:A}\\lean{Toy.A}\n"
+        "  A.\n"
+        "\\end{definition}\n"
+        "\\begin{lemma}\\label{lem:t}\\lean{Toy.t}\\leanok\n"
+        "  T. \\uses{def:A}\n"
+        "\\end{lemma}\n",
+        encoding="utf-8",
+    )
+    (project / "Basic.lean").write_text(lean_source, encoding="utf-8")
+    (project / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+
+
+def test_generate_rejects_project_local_syntax_without_writing(tmp_path, capsys):
+    """A copied def relying on project-local notation cannot be reproduced
+    in self-contained Defs.lean: `generate` must fail with an actionable
+    diagnostic and write no game files (issue #17)."""
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        'local notation "η" => Nat\n\n'
+        "namespace Toy\n\n"
+        "def A : η :=\n  1\n\n"
+        "theorem t : A = A := by\n  rfl\n\n"
+        "end Toy\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "Toy.A" in err
+    assert "notation" in err
+
+
+def test_generate_rejects_project_open_without_writing(tmp_path, capsys):
+    """`open Ks` of a project-local namespace cannot be reproduced
+    self-contained in the generated files: reject before writing."""
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        "open Ks\n\n"
+        "namespace Toy\n\n"
+        "def A : Nat :=\n  k + 1\n\n"
+        "theorem t : A = A := by\n  rfl\n\n"
+        "end Toy\n",
+    )
+    (project / "Ks.lean").write_text(
+        "namespace Ks\n\ndef k : Nat := 1\n\nend Ks\n", encoding="utf-8"
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "Toy.A" in err
+    assert "Ks" in err
+
+
 def test_deterministic_output(generated, tmp_path):
     again = tmp_path / "game2"
     assert main(["generate", str(PROJECT), "-o", str(again), "--title", "Toy Game"]) == 0

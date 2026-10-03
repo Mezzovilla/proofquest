@@ -249,6 +249,118 @@ def test_render_defs_root_qualified(tmp_path):
     assert "namespace Solution" not in rendered
 
 
+def test_notation_command_ends_declaration_block(tmp_path):
+    """A `notation` command is a file-level command, never part of the
+    preceding declaration's `source_text`."""
+    path = tmp_path / "Notation.lean"
+    path.write_text(
+        'def a : Nat := 1\nnotation "K" => Nat\ndef b : Nat := 2\n',
+        encoding="utf-8",
+    )
+    decls = {d.full_name: d for d in _parse_file(path)}
+    assert decls["a"].source_text == "def a : Nat := 1"
+    assert decls["b"].source_text == "def b : Nat := 2"
+
+
+def test_local_syntax_commands_are_recorded(tmp_path):
+    path = tmp_path / "Basic.lean"
+    path.write_text(
+        'local notation "η" => Nat\n\n'
+        "namespace Toy\n\n"
+        "def base : η := 1\n\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    base = decls["Toy.base"]
+    assert base.module == "Basic"
+    assert base.local_syntax == ["notation"]
+
+
+def test_local_syntax_follows_project_imports(tmp_path):
+    """Notation defined in an imported *project* module shapes the importing
+    file's context even though the import itself is not copied."""
+    (tmp_path / "Notation.lean").write_text(
+        'notation "K" => Nat\n', encoding="utf-8"
+    )
+    (tmp_path / "Use.lean").write_text(
+        "import Notation\nimport Mathlib.Data.Nat.Basic\n\n"
+        "def uses_k : K := 1\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    uses_k = decls["uses_k"]
+    assert "notation" in uses_k.local_syntax
+    assert "Mathlib.Data.Nat.Basic" in uses_k.imports
+
+
+def test_local_syntax_only_applies_after_its_position(tmp_path):
+    """A command cannot affect declarations earlier in the same file."""
+    (tmp_path / "Basic.lean").write_text(
+        "def early : Nat := 1\n"
+        'notation "K" => Nat\n'
+        "def late : Nat := 2\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["early"].local_syntax == []
+    assert decls["late"].local_syntax == ["notation"]
+
+
+def test_local_syntax_ignores_comments_and_scoped_set_option(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "/- notation \"fake\" => Nat -/\n"
+        "-- set_option maxHeartbeats 0\n"
+        "set_option pp.all true in\n"
+        "def a : Nat := 1\n"
+        "def b : Nat := 2\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["a"].local_syntax == []
+    assert decls["b"].local_syntax == []
+
+
+def test_local_syntax_includes_private_and_macro_forms(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        'private notation "K" => Nat\n'
+        'macro "m" : term => `(1)\n'
+        "def a : Nat := 1\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["a"].local_syntax == ["notation", "macro"]
+
+
+def test_file_wide_set_option_is_file_context(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "set_option maxHeartbeats 0\n"
+        "def a : Nat := 1\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["a"].local_syntax == ["set_option"]
+
+
+def test_local_syntax_ignores_nested_block_comments(tmp_path):
+    """Lean block comments nest: a `-/` inside only closes the inner one,
+    so a trailing `notation` after the outer `-/` must not be scanned."""
+    (tmp_path / "Basic.lean").write_text(
+        "/- outer /- inner -/ notation \"fake\" => Nat -/\n"
+        "def s : String := \"-- notation \\\"s\\\" => Nat\"\n"
+        "def a : Nat := 1\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["a"].local_syntax == []
+    assert decls["s"].local_syntax == []
+
+
+def test_no_local_syntax_in_plain_files(tmp_path):
+    decls = parse_project(write_source(tmp_path).parent)
+    assert decls["Toy.A"].local_syntax == []
+
+
 def test_no_special_case_for_fixture_project_names(tmp_path):
     consumer = tmp_path / "Consumer.lean"
     consumer.write_text(

@@ -427,6 +427,520 @@ def test_source_refs_ignore_string_literals_and_local_binders():
     assert copied == ["Toy.B"]
 
 
+_SOLUTION_DECL = _decl(
+    keyword="structure", name="Solution", full_name="Solution",
+    signature="where\n  (a : Nat)",
+    source_text="structure Solution where\n  (a : Nat)",
+)
+
+
+def test_field_notation_dep_on_sibling_def_is_copied_first():
+    """`S.y` where `S : Solution` is receiver-type-directed dot notation for
+    `Solution.y`; it must land in Defs.lean *before* the declaration that
+    uses it, like the source order."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:spec", ["Toy.y_spec"], 0),
+            _theorem_node("lem:t", 1, uses=["def:spec"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Solution": _SOLUTION_DECL,
+        "Solution.y": _decl(keyword="def", name="y", full_name="Solution.y",
+                            namespace="Solution",
+                            source_text="def y : Nat :=\n  1"),
+        "Toy.y_spec": _decl(
+            keyword="def", name="y_spec", full_name="Toy.y_spec", namespace="Toy",
+            signature="(S : Solution) : Nat",
+            source_text="def y_spec (S : Solution) : Nat :=\n  S.y + 1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Solution", "Solution.y", "Toy.y_spec"]
+
+
+def test_field_notation_shared_suffix_is_not_ambiguous_when_typed():
+    """`S.y` with `S : Solution` resolves to `Solution.y` only; unrelated
+    declarations sharing the `y` tail neither hijack nor make it ambiguous."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:spec", ["Toy.y_spec"], 0),
+            _theorem_node("lem:t", 1, uses=["def:spec"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Solution": _SOLUTION_DECL,
+        "Solution.y": _decl(keyword="def", name="y", full_name="Solution.y",
+                            namespace="Solution",
+                            source_text="def y : Nat :=\n  1"),
+        "Other.y": _decl(keyword="def", name="y", full_name="Other.y",
+                         namespace="Other",
+                         source_text="def y : Nat :=\n  2"),
+        "Toy.y_spec": _decl(
+            keyword="def", name="y_spec", full_name="Toy.y_spec", namespace="Toy",
+            signature="(S : Solution) : Nat",
+            source_text="def y_spec (S : Solution) : Nat :=\n  S.y + 1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Solution", "Solution.y", "Toy.y_spec"]
+
+
+def test_field_notation_external_receiver_ignores_project_suffix():
+    """`n.succ` with `n : Nat` is `Nat.succ`, not the unrelated project
+    declaration `Foo.succ`: no dependency is invented."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Foo.succ": _decl(keyword="def", name="succ", full_name="Foo.succ",
+                          namespace="Foo",
+                          source_text="def succ (n : Nat) : Nat :=\n  n"),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            signature="(n : Nat) : Nat",
+            source_text="def B (n : Nat) : Nat :=\n  n.succ",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Toy.B"]
+
+
+def test_field_notation_val_resolves_real_decl_before_accessor_stripping():
+    """`S.val` may denote a real declaration `Solution.val`; the generic
+    `.val` accessor stripping must not hide it."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:spec", ["Toy.spec"], 0),
+            _theorem_node("lem:t", 1, uses=["def:spec"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Solution": _SOLUTION_DECL,
+        "Solution.val": _decl(keyword="def", name="val", full_name="Solution.val",
+                              namespace="Solution",
+                              source_text="def val : Nat :=\n  1"),
+        "Toy.spec": _decl(
+            keyword="def", name="spec", full_name="Toy.spec", namespace="Toy",
+            signature="(S : Solution) : Nat",
+            source_text="def spec (S : Solution) : Nat :=\n  S.val",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Solution", "Solution.val", "Toy.spec"]
+
+
+def test_field_notation_dep_on_blueprint_theorem_is_error():
+    """`S.two_le_multiplicity` (dot notation on `S : Solution`) resolves to
+    the blueprint theorem `Solution.two_le_multiplicity`; a copied def
+    depending on a level theorem would dangle, so it must fail by name."""
+    helper = _theorem_node("lem:mult", 1)
+    helper.lean_names = ["Solution.two_le_multiplicity"]
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            helper,
+            _theorem_node("lem:t", 2, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Solution": _SOLUTION_DECL,
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            signature="(S : Solution) : Nat",
+            source_text="def B (S : Solution) : Nat :=\n"
+            "  if S.two_le_multiplicity then 1 else 2",
+        ),
+        "Solution.two_le_multiplicity": _decl(
+            name="two_le_multiplicity",
+            full_name="Solution.two_le_multiplicity",
+            namespace="Solution",
+            proof="by trivial",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "def:b" in message
+    assert "Toy.B" in message
+    assert "Solution.two_le_multiplicity" in message
+
+
+def test_field_notation_untyped_receiver_is_named_error():
+    """When the receiver type cannot be determined (e.g. a `fun`-bound `S`),
+    a project declaration sharing the tail is a material but unresolvable
+    dependency: named failure, not a guess and not a dangling reference."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:c", ["Toy.C"], 0),
+            _theorem_node("lem:t", 1, uses=["def:c"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "A.y": _decl(keyword="def", name="y", full_name="A.y", namespace="A",
+                     source_text="def y : Nat :=\n  1"),
+        "B.y": _decl(keyword="def", name="y", full_name="B.y", namespace="B",
+                     source_text="def y : Nat :=\n  2"),
+        "Toy.C": _decl(
+            keyword="def", name="C", full_name="Toy.C", namespace="Toy",
+            signature=": Nat",
+            source_text="def C : Nat :=\n  (fun S => S.y) 0",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "S.y" in message
+    assert "Toy.C" in message
+    assert "A.y" in message
+    assert "B.y" in message
+
+
+def test_field_notation_project_name_under_external_namespace():
+    """`n.succ` with `n : Nat` resolves a *project* `Nat.succ` even though
+    `Nat` itself has no declaration object: the type-directed name is probed
+    literally."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Nat.succ": _decl(keyword="def", name="succ", full_name="Nat.succ",
+                          namespace="Nat",
+                          source_text="def succ (n : Nat) : Nat :=\n  n"),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            signature="(n : Nat) : Nat",
+            source_text="def B (n : Nat) : Nat :=\n  n.succ",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Nat.succ", "Toy.B"]
+
+
+def test_field_notation_bare_tail_not_guessed_for_external_type():
+    """With `n : Nat`, `n.succ` is `Nat.succ` — an unrelated `Toy.succ` in
+    scope is not a fallback dependency."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.succ": _decl(keyword="def", name="succ", full_name="Toy.succ",
+                          namespace="Toy",
+                          source_text="def succ (n : Nat) : Nat :=\n  n"),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            signature="(n : Nat) : Nat",
+            source_text="def B (n : Nat) : Nat :=\n  n.succ",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Toy.B"]
+
+
+def test_field_notation_quantifier_binder_types_receiver():
+    """`∀ S : Solution, S.y` binds `S` with receiver type `Solution` even
+    outside parenthesized binders, so `Solution.y` is copied first; a level
+    theorem reached the same way is rejected by name."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:spec", ["Toy.spec"], 0),
+            _theorem_node("lem:t", 1, uses=["def:spec"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Solution": _SOLUTION_DECL,
+        "Solution.y": _decl(keyword="def", name="y", full_name="Solution.y",
+                            namespace="Solution",
+                            source_text="def y : Nat :=\n  1"),
+        "Toy.spec": _decl(
+            keyword="def", name="spec", full_name="Toy.spec", namespace="Toy",
+            signature=": Prop",
+            source_text="def spec : Prop :=\n  ∀ S : Solution, S.y = 1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Solution", "Solution.y", "Toy.spec"]
+
+
+def test_field_notation_quantifier_binder_blueprint_theorem_is_error():
+    """`∃ S : Solution, S.two_le_multiplicity` resolves to the blueprint
+    theorem just like a parenthesized binder would."""
+    helper = _theorem_node("lem:mult", 1)
+    helper.lean_names = ["Solution.two_le_multiplicity"]
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:spec", ["Toy.spec"], 0),
+            helper,
+            _theorem_node("lem:t", 2, uses=["def:spec"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Solution": _SOLUTION_DECL,
+        "Toy.spec": _decl(
+            keyword="def", name="spec", full_name="Toy.spec", namespace="Toy",
+            signature=": Prop",
+            source_text="def spec : Prop :=\n"
+            "  ∃ S : Solution, S.two_le_multiplicity",
+        ),
+        "Solution.two_le_multiplicity": _decl(
+            name="two_le_multiplicity",
+            full_name="Solution.two_le_multiplicity",
+            namespace="Solution",
+            proof="by trivial",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "def:spec" in message
+    assert "Solution.two_le_multiplicity" in message
+
+
+def test_field_notation_project_type_missing_target_is_named_error():
+    """`S : Solution` makes `S.y` type-directed; when `Solution.y` does not
+    exist but some other project `*.y` might be the intended target, reject
+    rather than emit a reference the generated file cannot resolve."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:c", ["Toy.C"], 0),
+            _theorem_node("lem:t", 1, uses=["def:c"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Solution": _SOLUTION_DECL,
+        "Other.y": _decl(keyword="def", name="y", full_name="Other.y",
+                         namespace="Other",
+                         source_text="def y : Nat :=\n  2"),
+        "Toy.C": _decl(
+            keyword="def", name="C", full_name="Toy.C", namespace="Toy",
+            signature="(S : Solution) : Nat",
+            source_text="def C (S : Solution) : Nat :=\n  S.y + 1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "S.y" in message
+    assert "Other.y" in message
+
+
+def test_copied_decl_with_local_syntax_is_error():
+    """A def whose source context defines project-local notation cannot be
+    reproduced verbatim in self-contained Defs.lean: reject it by name. The
+    diagnostic names the command kinds, never raw syntax (which could carry
+    string literals)."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            module="Basic",
+            source_text="def B : η :=\n  1",
+            local_syntax=["notation"],
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "def:b" in message
+    assert "Toy.B" in message
+    assert "Basic" in message
+    assert "notation" in message
+    assert "η" not in message
+
+
+def test_copied_dep_with_local_syntax_is_error():
+    """The rejection also fires through a copied *dependency*'s context."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+                       source_text="def B : Nat :=\n  Other.base + 1"),
+        "Other.base": _decl(
+            keyword="def", name="base", full_name="Other.base", namespace="Other",
+            module="Other",
+            source_text="def base : K :=\n  1",
+            local_syntax=["notation"],
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "Other.base" in message
+    assert "notation" in message
+
+
+def test_copied_decl_with_project_open_is_error():
+    """`open Ks` where `Ks` is a project namespace cannot be reproduced
+    self-contained (only the copied subset would be opened): reject."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Ks.k": _decl(keyword="def", name="k", full_name="Ks.k", namespace="Ks",
+                      source_text="def k : Nat :=\n  1"),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            opens=["open Ks"],
+            source_text="def B : Nat :=\n  k + 1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "def:b" in message
+    assert "Toy.B" in message
+    assert "Ks" in message
+
+
+def test_copied_decl_with_external_open_is_fine():
+    """`open` of a namespace that isn't project-local stays supported."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            opens=["open scoped BigOperators"],
+            source_text="def B : Nat :=\n  1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Toy.B"]
+
+
+def test_level_theorem_with_local_syntax_is_error():
+    """A level's Statement/sample proof likewise cannot reproduce
+    project-local notation; reject before writing the game."""
+    blueprint = Blueprint(
+        nodes=[_theorem_node("lem:t", 0)],
+        chapters=["Ch"],
+    )
+    decls = {
+        "t": _decl(
+            name="t", full_name="t", proof="by exact trivial",
+            local_syntax=["set_option"],
+        ),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "lem:t" in message
+    assert "t" in message
+    assert "set_option" in message
+
+
+def test_copy_dependency_cycle_is_error():
+    """A dependency cycle (impossible in valid Lean, reachable through the
+    text-level approximation) is reported, not emitted in arbitrary order."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:a", ["Toy.A"], 0),
+            _theorem_node("lem:t", 1, uses=["def:a"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Toy.A": _decl(keyword="def", name="A", full_name="Toy.A", namespace="Toy",
+                       source_text="def A : Nat :=\n  B"),
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+                       source_text="def B : Nat :=\n  A"),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "def:a" in message
+    assert "cycle" in message
+    assert "Toy.A" in message and "Toy.B" in message
+
+
 def test_shared_listed_decl_doc_goes_to_first_node_in_order():
     """A decl listed by two definition nodes is documented by the first one
     in topological order, even when copied earlier as a dependency."""

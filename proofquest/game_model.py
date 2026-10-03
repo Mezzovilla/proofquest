@@ -54,6 +54,9 @@ class LeanDecl:
     variables: list[str] = field(default_factory=list)  # active `variable` lines
     imports: list[str] = field(default_factory=list)  # external Mathlib imports needed
     opens: list[str] = field(default_factory=list)  # active `open` statements
+    module: str = ""
+    line: int = 0
+    local_syntax: list[str] = field(default_factory=list)
 
     @property
     def is_definition(self) -> bool:
