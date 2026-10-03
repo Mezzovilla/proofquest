@@ -184,9 +184,20 @@ def _proof_bound_names(proof: str) -> set[str]:
     names: set[str] = set()
     names.update(match.group(1) for match in _HAVE_LET_SET_RE.finditer(proof))
     names.update(match.group(1) for match in _SET_WITH_RE.finditer(proof))
-    for regex in (_INTRO_RE, _OBTAIN_RE, _RCASES_WITH_RE, _FUN_RE, _FORALL_EXISTS_RE, _CHOOSE_RE):
+    for regex in (_INTRO_RE, _OBTAIN_RE, _RCASES_WITH_RE, _FUN_RE, _CHOOSE_RE):
         for match in regex.finditer(proof):
             names.update(re.findall(r"[A-Za-z_][A-Za-z0-9_']*", match.group(1)))
+    for match in _FORALL_EXISTS_RE.finditer(proof):
+        segment = match.group(1)
+        colon = segment.find(":")
+        names.update(
+            re.findall(
+                r"[A-Za-z_][A-Za-z0-9_']*",
+                segment[:colon] if colon >= 0 else segment,
+            )
+        )
+        for inner in _QUANTIFIER_TYPE_RE.finditer(segment):
+            names.update(inner.group(1).split())
     return names
 
 
@@ -298,6 +309,111 @@ def _resolve_project_decl(
     return None
 
 
+_QUANTIFIER_TYPE_RE = re.compile(
+    r"([A-Za-z_][\w']*(?:\s+[A-Za-z_][\w']*)*)\s*:\s*([^\s:]+)"
+)
+
+_HAVE_LET_TYPE_RE = re.compile(
+    r"\b(?:have|let)\s+([A-Za-z_][\w']*)\s*:\s*(.+?)\s*:="
+)
+
+
+def _binder_types(text: str) -> dict[str, str]:
+    """Map each name bound in ``text``'s binder groups to the head identifier
+    of its type expression: ``(S T : Solution')`` gives ``S -> Solution'`` and
+    ``T -> Solution'``. Quantifier binders (``∀ S : Solution, ...``), typed
+    ``have``/``let`` hypotheses and parenthesized body binders are covered
+    the same way. Binders without an explicit type yield no entry.
+    """
+    types: dict[str, str] = {}
+    for match in _BINDER_GROUP_RE.finditer(text):
+        depth = 1
+        i = match.end()
+        start = i
+        while i < len(text) and depth:
+            ch = text[i]
+            if ch in _OPEN:
+                depth += 1
+            elif ch in _CLOSE:
+                depth -= 1
+            i += 1
+        head = _IDENT_RE.search(text[start:i - 1])
+        if head is None:
+            continue
+        for name in match.group(1).split():
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_']*", name):
+                types[name] = head.group(0)
+    for match in _FORALL_EXISTS_RE.finditer(text):
+        for inner in _QUANTIFIER_TYPE_RE.finditer(match.group(1)):
+            head = _IDENT_RE.match(inner.group(2).strip())
+            if head is None:
+                continue
+            for name in inner.group(1).split():
+                types[name] = head.group(0)
+    for match in _HAVE_LET_TYPE_RE.finditer(text):
+        head = _IDENT_RE.match(match.group(2).strip())
+        if head is not None:
+            types[match.group(1)] = head.group(0)
+    return types
+
+
+def _resolve_bound_dot_ref(
+    name: str,
+    decl: LeanDecl,
+    decls: dict[str, LeanDecl],
+    binder_types: dict[str, str],
+) -> LeanDecl | None:
+    """Resolve ``S.rest`` where ``S`` is a bound variable, the way Lean does:
+    by the *receiver type*. ``S : Solution`` makes ``S.y`` denote
+    ``Solution.y`` and ``S.two_le_multiplicity`` denote
+    ``Solution.two_le_multiplicity`` — never an unrelated ``Foo.y``. The
+    type-directed name ``Solution.rest`` is probed literally (raw tail first,
+    so a real ``Solution.val`` decl wins over the generic ``.val`` accessor
+    interpretation) and through ``decl``'s namespace/opens, even when the
+    type itself has no declaration object (``n : Nat`` with a project-local
+    ``Nat.succ``). Lean's bare-name fallback is applied only when the
+    receiver type is itself a project declaration — a known external type
+    (``Nat``) means an external projection, never an unrelated ``Toy.succ``
+    guess. When the receiver type cannot be determined at all but a project
+    declaration shares the tail, the reference is a material but unresolvable
+    dependency: a :class:`GenerationError`, not a silent guess.
+    """
+    head, _, rest = name.partition(".")
+    type_head = binder_types.get(head)
+    if type_head is not None:
+        tails = [
+            tail
+            for tail in dict.fromkeys((rest, _strip_accessor_suffix(rest)))
+            if tail
+        ]
+        for tail in tails:
+            found = _resolve_project_decl(f"{type_head}.{tail}", decl, decls)
+            if found is not None:
+                return found
+        type_decl = _resolve_project_decl(type_head, decl, decls)
+        if type_decl is not None:
+            for tail in dict.fromkeys((*tails, rest.split(".")[-1])):
+                if tail:
+                    found = _resolve_project_decl(tail, decl, decls)
+                    if found is not None:
+                        return found
+        elif type_head[0].isupper() or "." in type_head:
+            return None
+    candidates = sorted(
+        key for key in decls
+        if key == rest
+        or key.endswith((f".{rest}", f".{_strip_accessor_suffix(rest)}"))
+    )
+    if candidates:
+        raise GenerationError(
+            f"cannot determine the receiver type of {name} in "
+            f"{decl.full_name}: it could refer to "
+            f"{', '.join(candidates)}; annotate the binder type or qualify "
+            "the reference explicitly in the source"
+        )
+    return None
+
+
 def _source_refs(decl: LeanDecl, decls: dict[str, LeanDecl]) -> list[LeanDecl]:
     """Project-local declarations referenced anywhere in ``decl``'s source.
 
@@ -315,24 +431,76 @@ def _source_refs(decl: LeanDecl, decls: dict[str, LeanDecl]) -> list[LeanDecl]:
     for var_line in decl.variables:
         bound |= _binder_names(var_line)
     text += "\n" + "\n".join(decl.variables)
+    binder_types = _binder_types(text)
     bound.add(decl.name)
     bound.add(decl.full_name)
     refs: list[LeanDecl] = []
     seen: set[str] = set()
     for match in _IDENT_RE.finditer(text):
-        name = _strip_accessor_suffix(match.group(0))
+        raw = match.group(0)
+        name = _strip_accessor_suffix(raw)
         if name.strip("_") == "":
             continue
         head = name.split(".", 1)[0]
         if head in _KNOWN_TACTICS or head in _TERM_KEYWORDS or head in _LEAN_KEYWORDS:
             continue
-        if head in bound or name in seen:
+        if raw in seen:
             continue
-        seen.add(name)
-        dep = _resolve_project_decl(name.removeprefix("_root_."), decl, decls)
+        seen.add(raw)
+        if head in bound:
+            dep = (
+                _resolve_bound_dot_ref(raw, decl, decls, binder_types)
+                if "." in raw
+                else None
+            )
+        else:
+            dep = _resolve_project_decl(name.removeprefix("_root_."), decl, decls)
         if dep is not None and dep is not decl:
             refs.append(dep)
     return refs
+
+
+def _project_scopes(decls: dict[str, LeanDecl]) -> set[str]:
+    """Dotted prefixes naming something project-local: every module name and
+    every declaration namespace, plus all of their prefixes. An ``open`` of
+    one of these cannot be reproduced verbatim in a generated file, because
+    the opened namespace would only contain the copied subset and silently
+    change name resolution.
+    """
+    scopes: set[str] = set()
+    for decl in decls.values():
+        for dotted in (decl.module, decl.namespace):
+            if not dotted:
+                continue
+            parts = dotted.split(".")
+            for i in range(1, len(parts) + 1):
+                scopes.add(".".join(parts[:i]))
+    return scopes
+
+
+def _project_open_targets(
+    decl: LeanDecl, project_scopes: set[str]
+) -> list[str]:
+    """Project-local namespaces opened by ``decl``'s ``open`` statements."""
+    bad: list[str] = []
+    for open_stmt in decl.opens:
+        for token in open_stmt.split()[1:]:
+            if token in ("scoped", "noncomputable", "private"):
+                continue
+            if token.startswith("(") or token in ("hiding", "renaming", "in"):
+                break
+            if not re.fullmatch(_IDENT_PART + r"(?:\." + _IDENT_PART + r")*", token):
+                break
+            parts = token.split(".")
+            if (
+                any(
+                    ".".join(parts[:i]) in project_scopes
+                    for i in range(1, len(parts) + 1)
+                )
+                and token not in bad
+            ):
+                bad.append(token)
+    return bad
 
 
 def _copy_order(
@@ -340,6 +508,7 @@ def _copy_order(
     decls: dict[str, LeanDecl],
     blueprint_theorems: set[str],
     label: str,
+    project_scopes: set[str],
 ) -> list[LeanDecl]:
     """``roots`` plus their transitive project-local dependencies, deps first.
 
@@ -349,15 +518,48 @@ def _copy_order(
     and can never be copied into ``Defs.lean`` (the duplicate name would
     clash with the level's own declaration), so depending on one — directly
     or transitively — is a :class:`GenerationError` rather than a silently
-    dangling reference.
+    dangling reference. Likewise, a declaration from a source context that
+    defines project-local notation/syntax cannot be reproduced verbatim in
+    the self-contained generated file, so it is rejected by name rather than
+    emitted broken; and a dependency cycle (impossible in valid Lean, but
+    reachable through the text-level dependency approximation) is reported
+    instead of being emitted in an arbitrary order.
     """
     ordered: list[LeanDecl] = []
     seen: set[str] = set()
+    visiting: list[str] = []
 
     def visit(decl: LeanDecl) -> None:
         if decl.full_name in seen:
             return
-        seen.add(decl.full_name)
+        if decl.full_name in visiting:
+            cycle = visiting[visiting.index(decl.full_name):] + [decl.full_name]
+            raise GenerationError(
+                f"{label}: dependency cycle among copied declarations "
+                f"({' -> '.join(cycle)}); cannot order them for Defs.lean"
+            )
+        if decl.local_syntax:
+            raise GenerationError(
+                f"{label}: copied declaration {decl.full_name} is declared "
+                f"in a source context (module {decl.module or '?'}) that "
+                "defines project-local commands which cannot be reproduced "
+                f"in Game/Generated/Defs.lean: "
+                + ", ".join(dict.fromkeys(decl.local_syntax))
+                + "; expand the notation/syntax manually or move the "
+                "declaration (and the declarations it uses) to a module "
+                "that does not rely on project-local syntax"
+            )
+        bad_opens = _project_open_targets(decl, project_scopes)
+        if bad_opens:
+            raise GenerationError(
+                f"{label}: copied declaration {decl.full_name} relies on "
+                f"project-local `open` ({', '.join(bad_opens)}) whose "
+                "namespace cannot be reproduced self-contained in "
+                "Game/Generated/Defs.lean; qualify the names explicitly or "
+                "move the declaration to a module that does not rely on "
+                "project-local opens"
+            )
+        visiting.append(decl.full_name)
         for dep in _source_refs(decl, decls):
             if dep.full_name in blueprint_theorems:
                 raise GenerationError(
@@ -367,6 +569,8 @@ def _copy_order(
                     "dependency in the source as a project definition"
                 )
             visit(dep)
+        visiting.pop()
+        seen.add(decl.full_name)
         ordered.append(decl)
 
     for root in roots:
@@ -496,6 +700,7 @@ def build_game(
             if name in decls and name not in def_node_by_name:
                 def_node_by_name[name] = node
 
+    project_scopes = _project_scopes(decls)
     definitions: list[tuple[LeanDecl, BlueprintNode | None]] = []
     def_closure_by_label: dict[str, list[LeanDecl]] = {}
     emitted_defs: set[str] = set()
@@ -515,7 +720,7 @@ def build_game(
             )
         named = [decls[name] for name in node.lean_names]
         named_names = {d.full_name for d in named}
-        copied = _copy_order(named, decls, theorem_names, node.label)
+        copied = _copy_order(named, decls, theorem_names, node.label, project_scopes)
         for dep in copied:
             if dep.full_name in emitted_defs:
                 continue
@@ -542,6 +747,27 @@ def build_game(
             raise GenerationError(
                 f"{node.label}: theorem has no matching Lean declaration "
                 f"(\\lean{{{', '.join(node.lean_names) or '?'}}})"
+            )
+        if decl.local_syntax:
+            raise GenerationError(
+                f"{node.label}: theorem {decl.full_name} is declared in a "
+                f"source context (module {decl.module or '?'}) that defines "
+                "project-local commands which cannot be reproduced in the "
+                "generated level files: "
+                + ", ".join(dict.fromkeys(decl.local_syntax))
+                + "; expand the notation/syntax manually or move the "
+                "declaration to a module that does not rely on "
+                "project-local syntax"
+            )
+        bad_opens = _project_open_targets(decl, project_scopes)
+        if bad_opens:
+            raise GenerationError(
+                f"{node.label}: theorem {decl.full_name} relies on "
+                f"project-local `open` ({', '.join(bad_opens)}) whose "
+                "namespace cannot be reproduced self-contained in the "
+                "generated level files; qualify the names explicitly or "
+                "move the declaration to a module that does not rely on "
+                "project-local opens"
             )
         world_id = _camel(node.chapter)
         if world_id in worlds and worlds[world_id].title != node.chapter:
