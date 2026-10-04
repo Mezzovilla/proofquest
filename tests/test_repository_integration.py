@@ -27,11 +27,14 @@ FLT3 = {
     "prefix": "FLT3",
 }
 FLT3_KNOWN_DIAGNOSTIC = (
-    "error: def:Solution1: copied declaration Solution' is declared in a source "
-    "context (module FLT3.FLT3) that defines project-local commands which cannot "
-    "be reproduced in Game/Generated/Defs.lean: attribute, notation3; expand the "
-    "notation/syntax manually or move the declaration (and the declarations it "
-    "uses) to a module that does not rely on project-local syntax"
+    "error: def:Solution1: copied declaration Solution' (FLT3/FLT3.lean:201) is "
+    "declared in a source context (module FLT3.FLT3) that defines project-local "
+    "commands which cannot be reproduced in Game/Generated/Defs.lean: attribute "
+    "(FLT3/Mathlib/NumberTheory/NumberField/Units.lean:318), instance "
+    "(FLT3/Mathlib/NumberTheory/NumberField/Units.lean:480), notation3 "
+    "(FLT3/FLT3.lean:153); expand the notation/syntax manually or move the "
+    "declaration (and the declarations it uses) to a module that does not rely "
+    "on project-local syntax"
 )
 BANACH_WORLDS = {
     "PreliminaryTechnicalResult": [
@@ -390,9 +393,9 @@ def _lake_workflow(output, evidence, context):
     if shutil.which("lake") is None:
         pytest.skip("requires lake/elan on PATH for generated-game build")
     for stage, timeout in (
-        ("lake-update", 600),
-        ("lake-cache", 1200),
-        ("lake-build", 1200),
+        ("lake-update", 1200),
+        ("lake-cache", 1800),
+        ("lake-build", 5400),
     ):
         argv = {
             "lake-update": ["lake", "update", "-R"],

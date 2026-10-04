@@ -1,6 +1,8 @@
+import pytest
+
 from proofquest.game_model import Game
 from proofquest.generator import _render_defs
-from proofquest.lean_parser import _parse_file, parse_project
+from proofquest.lean_parser import LeanParseError, _parse_file, parse_project
 
 SOURCE = """namespace Toy
 
@@ -549,3 +551,372 @@ def test_notation_with_indented_continuation_is_unsupported(tmp_path):
     late = parse_project(tmp_path)["late"]
     assert late.local_syntax == ["notation"]
     assert late.notations == []
+
+
+def test_closed_scope_context_does_not_leak(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Hidden\n"
+        "def secret : Nat := 1\n"
+        "end Hidden\n"
+        "section\n"
+        "open Hidden\n"
+        "variable (n : Nat)\n"
+        'local notation "Q" => Nat\n'
+        "local instance : Inhabited Nat := ⟨0⟩\n"
+        "def inside : Nat := n\n"
+        "end\n"
+        "theorem early : True := by\n  trivial\n"
+        "namespace Ns\n"
+        "instance : Nonempty Nat := ⟨0⟩\n"
+        'notation "W" => Nat\n'
+        "end Ns\n"
+        "def late : Nat := 0\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    late = decls["late"]
+    assert late.opens == []
+    assert late.variables == []
+    assert not any(n.pattern == '"Q"' for n in late.notations)
+    assert not [i for i in late.instances if "Inhabited" in i.signature]
+    assert [i for i in late.instances if "Nonempty" in i.signature]
+    assert any(
+        i.full_name.startswith("Ns.") for i in late.instances
+    )
+    early = decls["early"]
+    assert early.instances == []
+
+
+def test_local_notation_dies_at_scope_end(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "abbrev F (T : Type*) := T\n"
+        "section\n"
+        'local notation "X" T => F T\n'
+        "theorem inside : True := by\n  trivial\n"
+        "end\n"
+        "theorem outside : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert len(decls["inside"].notations) == 1
+    assert decls["outside"].notations == []
+
+
+def test_exported_instance_imported_without_open(tmp_path):
+    (tmp_path / "Base.lean").write_text(
+        "class Tagged (α : Type) where\n"
+        "namespace Bs\n"
+        "instance : Tagged Nat := ⟨⟩\n"
+        "end Bs\n"
+        "local instance : Tagged Bool := ⟨⟩\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Use.lean").write_text(
+        "import Base\n"
+        "def pick : Nat := default\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    pick = decls["pick"]
+    names = {i.full_name for i in pick.instances}
+    (only,) = names
+    assert only.startswith(f"Bs._instance_m{b'Base'.hex()}_")
+
+
+def test_instance_forms_parse_and_reject_correctly(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "class C (α : Type) where\n"
+        "instance (α : Type) [C α] : C (List α) := ⟨⟩\n"
+        "local instance named : C Nat := ⟨⟩\n"
+        "instance viaWhere : C Bool where\n"
+        "section\n"
+        "attribute [simp] Nat.add_comm\n"
+        "instance attrFree : C Char := ⟨⟩\n"
+        "end\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    (anon,) = [d for d in decls.values() if d.name.startswith("_instance_")]
+    assert anon.signature == "(α : Type) [C α] : C (List α)"
+    assert decls["named"].modifiers == ("local",)
+    assert "viaWhere" not in decls
+    assert decls["attrFree"].local_syntax == ["instance", "attribute"]
+
+
+def test_anonymous_instance_names_are_module_scoped(tmp_path):
+    for mod in ("A/B", "C/B"):
+        (tmp_path / mod.split("/")[0]).mkdir(exist_ok=True)
+        (tmp_path / f"{mod}.lean").write_text(
+            "class C (α : Type) where\n"
+            "instance : C Nat := ⟨⟩\n",
+            encoding="utf-8",
+        )
+    decls = parse_project(tmp_path)
+    assert f"_instance_m{b'A.B'.hex()}_l1" in decls
+    assert f"_instance_m{b'C.B'.hex()}_l1" in decls
+
+
+def test_anonymous_instance_names_distinguish_slug_colliding_modules(tmp_path):
+    for mod in ("A/B", "A_B"):
+        parent = tmp_path / mod.split("/")[0]
+        if "/" in mod:
+            parent.mkdir(exist_ok=True)
+        (tmp_path / f"{mod}.lean").write_text(
+            "class C (α : Type) where\n"
+            "instance : C Nat := ⟨⟩\n",
+            encoding="utf-8",
+        )
+    decls = parse_project(tmp_path)
+    assert f"_instance_m{b'A.B'.hex()}_l1" in decls
+    assert f"_instance_m{b'A_B'.hex()}_l1" in decls
+
+
+def test_anonymous_instance_names_cover_same_basename_and_root(tmp_path):
+    (tmp_path / "Sub").mkdir()
+    (tmp_path / "B.lean").write_text(
+        "class C (α : Type) where\n"
+        "instance : C Nat := ⟨⟩\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Sub" / "B.lean").write_text(
+        "instance : C Nat := ⟨⟩\n"
+        "namespace Ns\n"
+        "instance : C Bool := ⟨⟩\n"
+        "end Ns\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert f"_instance_m{b'B'.hex()}_l1" in decls
+    assert f"_instance_m{b'Sub.B'.hex()}_l0" in decls
+    assert f"Ns._instance_m{b'Sub.B'.hex()}_l2" in decls
+
+
+def test_anonymous_instance_name_collision_fails_closed(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "class C (α : Type) where\n"
+        "instance : C Nat := ⟨⟩\n"
+        f"def _instance_m{b'Basic'.hex()}_l1 : Nat := 0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(LeanParseError, match="collides"):
+        parse_project(tmp_path)
+
+
+def test_scoped_commands_need_line_order_and_open_scoped(tmp_path):
+    (tmp_path / "Base.lean").write_text(
+        "namespace Ns\n"
+        "def marker : Nat := 0\n"
+        "end Ns\n"
+        "namespace Ns\n"
+        'scoped notation "LATE" => Nat\n'
+        "end Ns\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Use.lean").write_text(
+        "import Base\n"
+        "open Ns\n"
+        "def early : Nat := marker\n"
+        "namespace Ns\n"
+        "def mid : Nat := 1\n"
+        "end Ns\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["early"].local_syntax == []
+    assert decls["Ns.mid"].local_syntax == ["notation"]
+
+
+def test_later_scoped_commands_do_not_taint_earlier_same_namespace(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Ns\n"
+        "def early : Nat := 1\n"
+        'scoped notation "LATE" => Nat\n'
+        "def late : Nat := 2\n"
+        "end Ns\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["Ns.early"].local_syntax == []
+    assert decls["Ns.late"].local_syntax == ["notation"]
+
+
+def test_imported_scoped_activation_requires_open_scoped(tmp_path):
+    (tmp_path / "Base.lean").write_text(
+        "namespace Ns\n"
+        'scoped notation "S" => Nat\n'
+        "end Ns\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Plain.lean").write_text(
+        "import Base\n"
+        "open Ns\n"
+        "def plain : Nat := 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Scoped.lean").write_text(
+        "import Base\n"
+        "open scoped Ns\n"
+        "def sc : Nat := 1\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["plain"].local_syntax == []
+    scoped = decls["sc"]
+    assert scoped.local_syntax == ["notation"]
+    origin = next(
+        c for c in scoped.context if not c.supported and c.kind == "notation"
+    )
+    assert origin.source_path == "Base.lean"
+    assert origin.line == 1
+
+
+def test_private_instance_is_file_scoped_not_section_scoped(tmp_path):
+    (tmp_path / "Base.lean").write_text(
+        "class C (α : Type) where\n"
+        "section\n"
+        "private instance : C Nat := ⟨⟩\n"
+        "end\n"
+        "def after : Nat := 0\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Use.lean").write_text(
+        "import Base\n"
+        "def importer : Nat := 0\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    expected = f"_instance_m{b'Base'.hex()}_l2"
+    assert [i.name for i in decls["after"].instances] == [expected]
+    assert [i.name for i in decls["importer"].instances] == [expected]
+
+
+def test_duplicate_same_target_notation_is_supported(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "abbrev A (T : Type*) := T\n"
+        'notation "X" T => A T\n'
+        'notation "X" T => A T\n'
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    late = parse_project(tmp_path)["late"]
+    assert late.local_syntax == []
+    assert len(late.notations) == 1
+
+
+def _no_command_local_in(decl):
+    return all("in" not in c.source_text.split() for c in decl.context)
+
+
+def test_command_local_open_binds_only_next_declaration(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "open Nat in\n"
+        "theorem target : Nat.succ 0 = 1 := rfl\n\n"
+        "theorem follow : Nat.succ 0 = 1 := rfl\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    target, follow = decls["target"], decls["follow"]
+    assert target.local_syntax == ["open"]
+    assert target.opens == []
+    origin = next(c for c in target.context if c.kind == "open")
+    assert not origin.supported
+    assert origin.source_path == "Basic.lean"
+    assert origin.line == 0
+    assert follow.local_syntax == []
+    assert follow.opens == []
+    assert _no_command_local_in(follow)
+
+
+def test_command_local_open_skips_blank_comments_modifiers_and_attrs(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "section\n\n"
+        "open Nat in\n\n"
+        "-- a comment between open and target\n\n"
+        "private\n"
+        "theorem target : Nat.succ 0 = 1 := rfl\n\n"
+        "end\n\n"
+        "open Nat in\n"
+        "@[simp] theorem attrTarget : Nat.succ 0 = 1 := rfl\n\n"
+        "open Nat in\n\n"
+        "@[simp]\n"
+        "theorem attrLine : Nat.succ 0 = 1 := rfl\n\n"
+        "theorem follow : Nat.succ 0 = 1 := rfl\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["target"].local_syntax == ["open"]
+    assert decls["attrTarget"].local_syntax == ["open"]
+    assert decls["attrLine"].local_syntax == ["open"]
+    follow = decls["follow"]
+    assert follow.local_syntax == []
+    assert follow.opens == []
+    assert _no_command_local_in(follow)
+
+
+def test_command_local_open_inside_namespace(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Ns\n\n"
+        "open Nat in\n"
+        "theorem target : Nat.succ 0 = 1 := rfl\n\n"
+        "theorem follow : Nat.succ 0 = 1 := rfl\n\n"
+        "end Ns\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["Ns.target"].local_syntax == ["open"]
+    assert decls["Ns.follow"].local_syntax == []
+    assert _no_command_local_in(decls["Ns.follow"])
+
+
+def test_command_local_variable_is_conservatively_unsupported(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "variable (n : Nat) in\n"
+        "theorem target : Nat.succ 0 = 1 := rfl\n\n"
+        "theorem follow : Nat.succ 0 = 1 := rfl\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["target"].local_syntax == ["variable"]
+    assert decls["target"].variables == []
+    follow = decls["follow"]
+    assert follow.local_syntax == []
+    assert follow.variables == []
+    assert _no_command_local_in(follow)
+
+
+def test_same_line_command_local_open_misses_decl_without_leaking(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "open Nat in theorem target : Nat.succ 0 = 1 := rfl\n\n"
+        "theorem follow : Nat.succ 0 = 1 := rfl\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert "target" not in decls
+    follow = decls["follow"]
+    assert follow.local_syntax == []
+    assert follow.opens == []
+    assert _no_command_local_in(follow)
+
+
+def test_command_local_open_without_identifiable_target_fails_closed(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "theorem keep : Nat.succ 0 = 1 := rfl\n\n"
+        "open Nat in\n\n"
+        "-- nothing follows\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(LeanParseError, match="Basic.lean"):
+        parse_project(tmp_path)
+
+
+def test_ordinary_open_still_applies_normally(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "open Nat\n\n"
+        "theorem target : succ 0 = 1 := rfl\n\n"
+        "theorem follow : succ 0 = 1 := rfl\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["target"].opens == ["open Nat"]
+    assert decls["follow"].opens == ["open Nat"]
+    assert decls["follow"].local_syntax == []

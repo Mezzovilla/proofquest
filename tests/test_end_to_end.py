@@ -1,6 +1,9 @@
 """End-to-end test: generate the game for the toy_example project."""
 
 import filecmp
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -172,7 +175,7 @@ def test_generate_replays_plain_global_notation_locally(tmp_path):
     assert "abbrev NormMap (T : Type*) := T" in defs
     assert "local notation" not in defs
     level = (out / "Game" / "Levels" / "C" / "L01_t.lean").read_text()
-    assert "section\nlocal notation \"‖\" T \"·‖\" => _root_.Toy.NormMap T" in level
+    assert "local notation \"‖\" T \"·‖\" => _root_.Toy.NormMap T" in level
     assert "Statement t (T : Type*) (x : ‖T·‖) : ‖T ·‖ := by" in level
     assert "NewDefinition Toy.NormMap Toy.A" in level
     assert (out / "Game" / "Generated" / "TacticDocs.lean").read_text().startswith(
@@ -326,3 +329,293 @@ def test_deterministic_output(generated, tmp_path):
             assert_equal(sub)
 
     assert_equal(comparison)
+
+
+def _write_scoped_context_project(project: Path, base_body: str | None = None) -> None:
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        "\\chapter{C}\n"
+        "\\begin{definition}\\label{def:d}\\lean{Toy.d}\n  D.\n\\end{definition}\n"
+        "\\begin{definition}\\label{def:pick}\\lean{Toy.pick}\n  P.\n\\end{definition}\n"
+        "\\begin{definition}\\label{def:pickL}\\lean{Toy.pickL}\n  L.\n\\end{definition}\n"
+        "\\begin{definition}\\label{def:c}\\lean{Toy.c}\n  C.\n\\end{definition}\n"
+        "\\begin{definition}\\label{def:aliasUse}\\lean{Toy.aliasUse}\n  A.\n\\end{definition}\n"
+        "\\begin{lemma}\\label{lem:t}\\lean{Toy.t}\\leanok\n"
+        "  T. \\uses{def:d,def:pick,def:pickL}\n\\end{lemma}\n"
+        "\\begin{lemma}\\label{lem:t2}\\lean{Toy.t2}\\leanok\n  T2.\n\\end{lemma}\n"
+        "\\begin{lemma}\\label{lem:tc}\\lean{Toy.tc}\\leanok\n"
+        "  TC. \\uses{def:c}\n\\end{lemma}\n"
+        "\\begin{lemma}\\label{lem:t3}\\lean{Toy.t3}\\leanok\n"
+        "  T3. \\uses{def:aliasUse}\n\\end{lemma}\n",
+        encoding="utf-8",
+    )
+    (project / "Base.lean").write_text(
+        "import Mathlib.Tactic\n\n"
+        "class Tagged (α : Type) where\n"
+        "  tag : α\n\n"
+        "namespace Bs\n"
+        "instance : Tagged Nat := ⟨1⟩\n"
+        "end Bs\n\n"
+        "local instance : Tagged Bool := ⟨true⟩\n\n"
+        "namespace Ctx\n"
+        "def double (n : Nat) : Nat := n + n\n"
+        'notation "!!" x => double x\n'
+        "end Ctx\n"
+        + (base_body or ""),
+        encoding="utf-8",
+    )
+    (project / "Middle.lean").write_text(
+        "import Base\n\n"
+        "namespace Mid\n"
+        "instance (α : Type) [Tagged α] : Tagged (List α) := ⟨[]⟩\n"
+        "end Mid\n",
+        encoding="utf-8",
+    )
+    (project / "Use.lean").write_text(
+        "import Middle\n\n"
+        "namespace Toy\n\n"
+        "def d : Nat := !! 3\n\n"
+        "def pick : Nat := (inferInstance : Tagged Nat).tag\n\n"
+        "def pickL : List Nat := (inferInstance : Tagged (List Nat)).tag\n\n"
+        "section\n"
+        "local instance : Tagged Char := ⟨'c'⟩\n\n"
+        "def c : Char := (inferInstance : Tagged Char).tag\n\n"
+        "theorem tc : (inferInstance : Tagged Char).tag = 'c' := rfl\n"
+        "end\n\n"
+        'local notation "##" x => Ctx.double x\n\n'
+        "def aliasUse : Nat := ## 5\n\n"
+        "theorem t : pick = 1 ∧ d = 6 := by\n"
+        "  exact ⟨rfl, rfl⟩\n\n"
+        "theorem t2 : (inferInstance : Tagged Nat).tag = 1 := rfl\n\n"
+        "theorem t3 : pick + pick = ## (1) := by\n"
+        "  change pick + pick = ## (1)\n"
+        "  rfl\n\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    (project / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+
+
+def test_generate_transports_instances_and_notation(tmp_path):
+    project = tmp_path / "proj"
+    _write_scoped_context_project(project)
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+
+    defs = (out / "Game" / "Generated" / "Defs.lean").read_text()
+    assert "import Base" not in defs and "import Middle" not in defs
+    assert re.search(r"^(local |scoped )?instance ", defs, re.MULTILINE) is None
+    bs_def = re.search(
+        r"namespace Bs\n\ndef (_instance_m[0-9a-f]+_l\d+) : Tagged Nat := ⟨1⟩",
+        defs,
+    )
+    assert bs_def, defs
+    mid_def = re.search(
+        r"def (_instance_m[0-9a-f]+_l\d+) "
+        r"\(α : Type\) \[Tagged α\] : Tagged \(List α\) := ⟨\[\]⟩",
+        defs,
+    )
+    assert mid_def, defs
+    assert "namespace Mid\n" in defs
+    bool_def = re.search(
+        r"def (_instance_m[0-9a-f]+_l\d+) : Tagged Bool := ⟨true⟩", defs
+    )
+    assert bool_def, defs
+    char_def = re.search(
+        r"def (_instance_m[0-9a-f]+_l\d+) : Tagged Char := ⟨'c'⟩", defs
+    )
+    assert char_def, defs
+    assert (
+        "namespace Ctx\n\n"
+        f"attribute [local instance] _root_.Bs.{bs_def.group(1)}\n"
+        f"attribute [local instance] _root_.{bool_def.group(1)}\n\n"
+        "def double" in defs
+    )
+    assert (
+        "namespace Toy\n\n"
+        'local notation "!!" x => _root_.Ctx.double x\n'
+        f"attribute [local instance] _root_.Bs.{bs_def.group(1)}\n"
+        f"attribute [local instance] _root_.Mid.{mid_def.group(1)}" in defs
+    )
+    assert "def pick : Nat := (inferInstance : Tagged Nat).tag" in defs
+    assert 'local notation "##" x => _root_.Ctx.double x' in defs
+    assert "def aliasUse : Nat := ## 5" in defs
+    assert "def c : Char := (inferInstance : Tagged Char).tag" in defs
+    assert (
+        f"attribute [local instance] _root_.Toy.{char_def.group(1)}" in defs
+    )
+    assert "open scoped" not in defs
+    assert "section\n" in defs
+
+    if shutil.which("lean") is not None:
+        probe = tmp_path / "Emitted.lean"
+        probe.write_text(
+            "class C (α : Type) where\n"
+            "  val : α\n"
+            "namespace Ns\n"
+            "def inst : C Nat := ⟨1⟩\n"
+            "end Ns\n"
+            "section\n"
+            "attribute [local instance] _root_.Ns.inst\n"
+            "def use : Nat := (inferInstance : C Nat).val\n"
+            "end\n"
+            "def laterRef : Nat := Ns.inst.val\n",
+            encoding="utf-8",
+        )
+        ok = subprocess.run(
+            ["lean", str(probe)], capture_output=True, text=True, timeout=120, check=False
+        )
+        assert ok.returncode == 0, ok.stderr
+        probe.write_text(probe.read_text() + "def leak : Nat := (inferInstance : C Nat).val\n")
+        bad = subprocess.run(
+            ["lean", str(probe)], capture_output=True, text=True, timeout=120, check=False
+        )
+        assert bad.returncode != 0
+        assert "synthesize" in bad.stderr + bad.stdout
+        probe.write_text(
+            "class C (α : Type) where\n"
+            "  val : α\n"
+            "def early : Nat := (inferInstance : C Nat).val\n"
+            "def inst : C Nat := ⟨1⟩\n",
+            encoding="utf-8",
+        )
+        early = subprocess.run(
+            ["lean", str(probe)], capture_output=True, text=True, timeout=120, check=False
+        )
+        assert early.returncode != 0
+
+    level = (out / "Game" / "Levels" / "C" / "L02_t2.lean").read_text()
+    assert "open scoped" not in level
+    assert f"attribute [local instance] _root_.Bs.{bs_def.group(1)}" in level
+    assert "Statement t2 : (inferInstance : Tagged Nat).tag = 1 := by" in level
+
+    level_tc = (out / "Game" / "Levels" / "C" / "L03_tc.lean").read_text()
+    assert f"attribute [local instance] _root_.Toy.{char_def.group(1)}" in level_tc
+    assert "Statement tc : (inferInstance : Tagged Char).tag = 'c' := by" in level_tc
+
+    level_t3 = (out / "Game" / "Levels" / "C" / "L04_t3.lean").read_text()
+    assert 'local notation "##" x => _root_.Ctx.double x' in level_t3
+    assert "Statement t3 : pick + pick = ## (1) := by" in level_t3
+    assert "change pick + pick = ## (1)" in level_t3
+
+
+def test_generate_rejects_unsupported_instance_context(tmp_path, capsys):
+    project = tmp_path / "proj"
+    _write_scoped_context_project(
+        project,
+        base_body="\ninstance viaWhere : Tagged Int where\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "instance" in err
+    assert "Base.lean:" in err
+
+
+def _write_command_local_project(project: Path, lean_decls: str, lean_names: str) -> None:
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        "\\chapter{C}\n" + lean_names, encoding="utf-8"
+    )
+    (project / "Basic.lean").write_text(lean_decls, encoding="utf-8")
+    (project / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+
+
+def test_generate_rejects_command_local_open_target(tmp_path, capsys):
+    project = tmp_path / "proj"
+    _write_command_local_project(
+        project,
+        "namespace Toy\n\n"
+        "open Nat in\n"
+        "def A : Nat := succ 0\n\n"
+        "theorem t : A = A := by\n  rfl\n\n"
+        "end Toy\n",
+        "\\begin{definition}\\label{def:A}\\lean{Toy.A}\n  A.\n\\end{definition}\n"
+        "\\begin{lemma}\\label{lem:t}\\lean{Toy.t}\\leanok\n"
+        "  T. \\uses{def:A}\n\\end{lemma}\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "Toy.A" in err
+    assert "open" in err
+    assert "Basic.lean:3" in err
+
+
+def test_generate_command_local_open_leaves_following_decl_clean(tmp_path):
+    project = tmp_path / "proj"
+    _write_command_local_project(
+        project,
+        "namespace Toy\n\n"
+        "open Nat in\n"
+        "theorem target : Nat.succ 0 = 1 := rfl\n\n"
+        "theorem follow : Nat.succ 0 = 1 := by\n  rfl\n\n"
+        "end Toy\n",
+        "\\begin{lemma}\\label{lem:f}\\lean{Toy.follow}\\leanok\n  F.\n\\end{lemma}\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+
+    defs = (out / "Game" / "Generated" / "Defs.lean").read_text()
+    level = (out / "Game" / "Levels" / "C" / "L01_follow.lean").read_text()
+    for text in (defs, level):
+        assert "open Nat in" not in text
+        assert "open\n" not in text
+    assert "Statement follow : Nat.succ 0 = 1 := by" in level
+
+
+def test_generate_rejects_same_line_command_local_open_without_leaking(
+    tmp_path, capsys
+):
+    project = tmp_path / "proj"
+    _write_command_local_project(
+        project,
+        "namespace Toy\n\n"
+        "open Nat in theorem target : Nat.succ 0 = 1 := rfl\n\n"
+        "theorem follow : Nat.succ 0 = 1 := by\n  rfl\n\n"
+        "end Toy\n",
+        "\\begin{lemma}\\label{lem:t}\\lean{Toy.target}\\leanok\n"
+        "  T.\n\\end{lemma}\n"
+        "\\begin{lemma}\\label{lem:f}\\lean{Toy.follow}\\leanok\n"
+        "  F.\n\\end{lemma}\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "Toy.target" in err
+    assert "not found in the Lean sources" in err
+
+
+def test_generate_rejects_command_local_variable_target(tmp_path, capsys):
+    project = tmp_path / "proj"
+    _write_command_local_project(
+        project,
+        "namespace Toy\n\n"
+        "variable (n : Nat) in\n"
+        "def A : Nat := succ 0\n\n"
+        "theorem t : A = A := by\n  rfl\n\n"
+        "end Toy\n",
+        "\\begin{definition}\\label{def:A}\\lean{Toy.A}\n  A.\n\\end{definition}\n"
+        "\\begin{lemma}\\label{lem:t}\\lean{Toy.t}\\leanok\n"
+        "  T. \\uses{def:A}\n\\end{lemma}\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "Toy.A" in err
+    assert "variable" in err
+    assert "Basic.lean:3" in err
