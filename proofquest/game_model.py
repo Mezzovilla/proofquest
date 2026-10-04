@@ -50,6 +50,20 @@ class LeanNotation:
     arguments: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class LeanContextCommand:
+    module: str
+    source_path: str
+    line: int
+    end_line: int
+    namespace: str
+    scope: tuple[str, ...]
+    kind: str
+    source_text: str
+    exported: bool
+    supported: bool
+
+
 @dataclass
 class LeanDecl:
     """One declaration extracted from the Lean sources of the input project."""
@@ -68,10 +82,15 @@ class LeanDecl:
     line: int = 0
     local_syntax: list[str] = field(default_factory=list)
     notations: list[LeanNotation] = field(default_factory=list)
+    source_path: str = ""
+    modifiers: tuple[str, ...] = ()
+    scope: tuple[str, ...] = ()
+    context: tuple[LeanContextCommand, ...] = ()
+    instances: list[LeanDecl] = field(default_factory=list)
 
     @property
     def is_definition(self) -> bool:
-        return self.keyword in ("def", "abbrev", "instance", "structure")
+        return self.keyword in ("def", "abbrev", "instance", "structure", "class")
 
 
 @dataclass

@@ -510,12 +510,55 @@ def _project_open_targets(
     return bad
 
 
+def _decl_origin(decl: LeanDecl) -> str:
+    if decl.source_path:
+        return f" ({decl.source_path}:{decl.line + 1})"
+    return ""
+
+
+def _unsupported_context_message(
+    label: str,
+    decl: LeanDecl,
+    visiting: list[str],
+    target_file: str,
+) -> str:
+    parts: list[str] = []
+    for kind in dict.fromkeys(decl.local_syntax):
+        origin = next(
+            (
+                f" ({command.source_path}:{command.line + 1})"
+                for command in decl.context
+                if not command.supported
+                and command.kind == kind
+                and command.source_path
+            ),
+            "",
+        )
+        parts.append(kind + origin)
+    chain = visiting + [decl.full_name]
+    message = (
+        f"{label}: copied declaration {decl.full_name}{_decl_origin(decl)} is "
+        f"declared in a source context (module {decl.module or '?'}) that "
+        f"defines project-local commands which cannot be reproduced in "
+        f"{target_file}: " + ", ".join(parts)
+    )
+    if len(chain) > 1:
+        message += f"; dependency chain: {' -> '.join(chain)}"
+    message += (
+        "; expand the notation/syntax manually or move the declaration (and "
+        "the declarations it uses) to a module that does not rely on "
+        "project-local syntax"
+    )
+    return message
+
+
 def _copy_order(
     roots: list[LeanDecl],
     decls: dict[str, LeanDecl],
     blueprint_theorems: set[str],
     label: str,
     project_scopes: set[str],
+    instance_roots: list[LeanDecl] | None = None,
 ) -> list[LeanDecl]:
     """``roots`` plus their transitive project-local dependencies, deps first.
 
@@ -534,54 +577,72 @@ def _copy_order(
     """
     ordered: list[LeanDecl] = []
     seen: set[str] = set()
+    seen_context: set[str] = set()
+    emitted_ordered: set[str] = set()
     visiting: list[str] = []
 
-    def visit(decl: LeanDecl) -> None:
-        if decl.full_name in seen:
-            return
+    def visit(dep: LeanDecl) -> None:
+        if dep.full_name in blueprint_theorems:
+            raise GenerationError(
+                f"{label}: copied declaration {visiting[-1] if visiting else dep.full_name} "
+                f"depends on blueprint theorem {dep.full_name}{_decl_origin(dep)}, "
+                "which becomes a game level and cannot be copied into "
+                "Defs.lean; restate that dependency in the source as a "
+                "project definition"
+            )
+        visit_or_context(dep)
+
+    def visit_or_context(decl: LeanDecl, as_context: bool = False) -> None:
         if decl.full_name in visiting:
             cycle = visiting[visiting.index(decl.full_name):] + [decl.full_name]
             raise GenerationError(
                 f"{label}: dependency cycle among copied declarations "
                 f"({' -> '.join(cycle)}); cannot order them for Defs.lean"
             )
+        if decl.full_name in seen or (as_context and decl.full_name in seen_context):
+            return
         if decl.local_syntax:
             raise GenerationError(
-                f"{label}: copied declaration {decl.full_name} is declared "
-                f"in a source context (module {decl.module or '?'}) that "
-                "defines project-local commands which cannot be reproduced "
-                f"in Game/Generated/Defs.lean: "
-                + ", ".join(dict.fromkeys(decl.local_syntax))
-                + "; expand the notation/syntax manually or move the "
-                "declaration (and the declarations it uses) to a module "
-                "that does not rely on project-local syntax"
+                _unsupported_context_message(
+                    label, decl, visiting, "Game/Generated/Defs.lean"
+                )
             )
         bad_opens = _project_open_targets(decl, project_scopes)
         if bad_opens:
             raise GenerationError(
-                f"{label}: copied declaration {decl.full_name} relies on "
-                f"project-local `open` ({', '.join(bad_opens)}) whose "
-                "namespace cannot be reproduced self-contained in "
-                "Game/Generated/Defs.lean; qualify the names explicitly or "
-                "move the declaration to a module that does not rely on "
-                "project-local opens"
+                f"{label}: copied declaration {decl.full_name}"
+                f"{_decl_origin(decl)} relies on project-local `open` "
+                f"({', '.join(bad_opens)}) whose namespace cannot be "
+                "reproduced self-contained in Game/Generated/Defs.lean; "
+                "qualify the names explicitly or move the declaration to a "
+                "module that does not rely on project-local opens"
             )
         visiting.append(decl.full_name)
         for dep in _source_refs(decl, decls):
-            if dep.full_name in blueprint_theorems:
-                raise GenerationError(
-                    f"{label}: copied declaration {decl.full_name} depends on "
-                    f"blueprint theorem {dep.full_name}, which becomes a game "
-                    "level and cannot be copied into Defs.lean; restate that "
-                    "dependency in the source as a project definition"
-                )
+            if as_context and dep.full_name in visiting:
+                continue
             visit(dep)
+        for inst in decl.instances:
+            visit_or_context(inst, as_context=True)
         visiting.pop()
-        seen.add(decl.full_name)
-        ordered.append(decl)
+        if as_context:
+            seen_context.add(decl.full_name)
+        else:
+            seen.add(decl.full_name)
+        if decl.full_name not in emitted_ordered:
+            emitted_ordered.add(decl.full_name)
+            ordered.append(decl)
 
     for root in roots:
-        visit(root)
+        if root.full_name in blueprint_theorems:
+            raise GenerationError(
+                f"{label}: blueprint theorem {root.full_name}"
+                f"{_decl_origin(root)} becomes a game level and cannot be "
+                "copied into Defs.lean"
+            )
+        visit_or_context(root)
+    for inst in instance_roots or ():
+        visit_or_context(inst, as_context=True)
     return ordered
 
 
@@ -759,21 +820,16 @@ def build_game(
             )
         if decl.local_syntax:
             raise GenerationError(
-                f"{node.label}: theorem {decl.full_name} is declared in a "
-                f"source context (module {decl.module or '?'}) that defines "
-                "project-local commands which cannot be reproduced in the "
-                "generated level files: "
-                + ", ".join(dict.fromkeys(decl.local_syntax))
-                + "; expand the notation/syntax manually or move the "
-                "declaration to a module that does not rely on "
-                "project-local syntax"
+                _unsupported_context_message(
+                    node.label, decl, [], "the generated level files"
+                ).replace("copied declaration", "theorem", 1)
             )
         bad_opens = _project_open_targets(decl, project_scopes)
         if bad_opens:
             raise GenerationError(
-                f"{node.label}: theorem {decl.full_name} relies on "
-                f"project-local `open` ({', '.join(bad_opens)}) whose "
-                "namespace cannot be reproduced self-contained in the "
+                f"{node.label}: theorem {decl.full_name}{_decl_origin(decl)} "
+                f"relies on project-local `open` ({', '.join(bad_opens)}) "
+                "whose namespace cannot be reproduced self-contained in the "
                 "generated level files; qualify the names explicitly or "
                 "move the declaration to a module that does not rely on "
                 "project-local opens"
@@ -784,7 +840,12 @@ def build_game(
             if notation.target in decls
         ]
         notation_copied = _copy_order(
-            notation_roots, decls, theorem_names, node.label, project_scopes
+            notation_roots,
+            decls,
+            theorem_names,
+            node.label,
+            project_scopes,
+            instance_roots=decl.instances,
         )
         append_definitions(notation_copied, node, set())
         world_id = _camel(node.chapter)
@@ -940,20 +1001,47 @@ def _strip_redundant_set(proof: str, signature: str) -> str:
     return body[i:].lstrip("\n")
 
 
-def _notation_block(decl: LeanDecl) -> str:
-    if not decl.notations:
-        return ""
-    lines = ["section"]
-    lines.extend(
-        " ".join(
-            (
-                f"local notation {notation.pattern} => _root_.{notation.target}",
-                *notation.arguments,
-            )
+def _emit_source(decl: LeanDecl) -> str:
+    if decl.keyword == "instance":
+        mods = "".join(
+            f"{m} " for m in decl.modifiers if m in ("noncomputable", "partial")
         )
-        for notation in decl.notations
-    )
-    return "\n".join(lines) + "\n\n"
+        return f"{mods}def {decl.name} {decl.signature} := {decl.proof}"
+    return decl.source_text
+
+
+def _context_lines(decl: LeanDecl) -> list[str]:
+    lines: list[str] = []
+    for command in decl.context:
+        if not command.supported:
+            continue
+        if command.kind in ("open", "variable"):
+            lines.append(command.source_text)
+        elif command.kind == "notation":
+            notation = next(
+                (
+                    n
+                    for n in decl.notations
+                    if n.module == command.module and n.line == command.line
+                ),
+                None,
+            )
+            if notation is not None:
+                lines.append(
+                    f"local notation {notation.pattern} => "
+                    f"_root_.{notation.target} {' '.join(notation.arguments)}"
+                )
+    return lines
+
+
+def _context_section(decl: LeanDecl) -> list[str]:
+    inner: list[str] = []
+    for line in _context_lines(decl):
+        if line not in inner:
+            inner.append(line)
+    for inst in decl.instances:
+        inner.append(f"attribute [local instance] _root_.{inst.full_name}")
+    return inner
 
 
 def _statement_proof(level: Level) -> str:
@@ -993,17 +1081,23 @@ def _render_level(game: Game, level: Level, previous: Level | None) -> str:
         f"/-- {_doc_comment(level.intro_md)} -/\n"
         f'TheoremDoc {decl.full_name} as "{decl.name}" in "{lean_string(world_title)}"'
     )
-    var_block = "\n".join(decl.variables) + "\n\n" if decl.variables else ""
-    open_block = "\n".join(decl.opens) + "\n\n" if decl.opens else ""
-    notation_block = _notation_block(decl)
-    section_end = "\n\nend" if notation_block else ""
-    body = f"{notation_block}{var_block}{open_block}{doc}\n\n{statement}{section_end}"
-    if decl.namespace:
-        parts.append(
-            f"namespace {decl.namespace}\n\n{body}\n\nend {decl.namespace}"
-        )
+    inner = _context_section(decl)
+    if inner:
+        context = "\n".join(inner) + "\n\n"
+        body = f"{context}{doc}\n\n{statement}"
+        if decl.namespace:
+            body = f"namespace {decl.namespace}\n\n{body}\n\nend {decl.namespace}"
+        parts.append(f"section\n{body}\n\nend")
     else:
-        parts.append(body)
+        var_block = "\n".join(decl.variables) + "\n\n" if decl.variables else ""
+        open_block = "\n".join(decl.opens) + "\n\n" if decl.opens else ""
+        body = f"{var_block}{open_block}{doc}\n\n{statement}"
+        if decl.namespace:
+            parts.append(
+                f"namespace {decl.namespace}\n\n{body}\n\nend {decl.namespace}"
+            )
+        else:
+            parts.append(body)
 
     parts.append('Conclusion "Level completed! 🎉"')
 
@@ -1066,6 +1160,8 @@ def _render_defs(game: Game) -> str:
     import_decls.extend(
         level.decl for world in game.worlds for level in world.levels
     )
+    for decl in list(import_decls):
+        import_decls.extend(decl.instances)
     for decl in import_decls:
         for imp in decl.imports:
             if imp not in seen:
@@ -1082,21 +1178,34 @@ def _render_defs(game: Game) -> str:
                 seen_opens.add(op)
                 all_opens.append(op)
     if all_opens:
-        parts.append("\n".join(all_opens))
+        parts.append("section\n" + "\n".join(all_opens) + "\nend")
     for decl, node in game.definitions:
         doc_md = (
             latex_to_markdown(node.statement_tex) if node else f"Definition `{decl.full_name}`."
         )
-        var_block = "\n".join(decl.variables) + "\n\n" if decl.variables else ""
-        notation_block = _notation_block(decl)
-        section_end = "\n\nend" if notation_block else ""
-        block = (
-            f"{notation_block}{var_block}{decl.source_text}\n\n"
+        inner = _context_section(decl)
+        doc = (
             f"/-- {_doc_comment(doc_md)} -/\n"
-            f'DefinitionDoc {decl.full_name} as "{decl.name}"{section_end}'
+            f'DefinitionDoc {decl.full_name} as "{decl.name}"'
         )
-        if decl.namespace:
-            block = f"namespace {decl.namespace}\n\n{block}\n\nend {decl.namespace}"
+        source = _emit_source(decl)
+        if inner:
+            context = "\n".join(inner) + "\n\n"
+            block = f"{context}{source}\n\n{doc}"
+            if decl.namespace:
+                block = (
+                    f"namespace {decl.namespace}\n\n{block}\n\nend {decl.namespace}"
+                )
+            block = f"section\n{block}\n\nend"
+        else:
+            var_block = (
+                "\n".join(decl.variables) + "\n\n" if decl.variables else ""
+            )
+            block = f"{var_block}{source}\n\n{doc}"
+            if decl.namespace:
+                block = (
+                    f"namespace {decl.namespace}\n\n{block}\n\nend {decl.namespace}"
+                )
         parts.append(block)
     return "\n\n".join(parts) + "\n"
 
