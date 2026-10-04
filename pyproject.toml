@@ -19,3 +19,8 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: real repository workflows requiring --run-integration, network, git and Lean",
+]

@@ -107,8 +107,9 @@ the game folder), so `lake`/`elan` must be on `PATH`. `Ctrl+C` stops hosting.
 ## Development
 
 ```bash
-uv run pytest       # unit + end-to-end tests
-uv run ruff check   # lint
+uv run pytest                   # unit + end-to-end tests; real integrations explicitly skip
+uv run pytest --run-integration # additionally clone/build the pinned real repositories
+uv run ruff check               # lint
 ```
 
 ## Known limitations
