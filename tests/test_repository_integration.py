@@ -439,6 +439,181 @@ def _raise_known_flt3_if_matched(generate, output, source, evidence, context):
     raise KnownFLT3Failure(FLT3_KNOWN_DIAGNOSTIC)
 
 
+def _write_staged_definition_project(project, split_worlds=False):
+    """A level theorem whose proof a definition needs, a blueprint
+    definition node for it, and a consumer level — in the same world, or
+    split so the prerequisite lives in world First and the consumer in
+    world Second."""
+    prereq_chapter, consumer_chapter = (
+        ("First", "Second") if split_worlds else ("C", "C")
+    )
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        f"\\chapter{{{prereq_chapter}}}\n"
+        "\\begin{lemma}\\label{lem:h}\\lean{Toy.helper}\\leanok\n"
+        "  H.\n"
+        "\\end{lemma}\n"
+        "\\begin{definition}\\label{def:dv}\\lean{Toy.depval}\n"
+        "  D.\n"
+        "\\end{definition}\n"
+        f"\\chapter{{{consumer_chapter}}}\n"
+        "\\begin{lemma}\\label{lem:t2}\\lean{Toy.t2}\\leanok\n"
+        "  T2. \\uses{def:dv}\n"
+        "\\end{lemma}\n",
+        encoding="utf-8",
+    )
+    (project / "Basic.lean").write_text(
+        "namespace Toy\n\n"
+        "theorem helper : True := by\n"
+        "  trivial\n\n"
+        "def depval : True :=\n"
+        "  helper\n\n"
+        "theorem t2 : True := by\n"
+        "  exact depval\n\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    (project / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+
+
+def _inventory_entry(level_file, category, name):
+    data = json.loads(level_file.read_text())
+    for item in data.get(category) or []:
+        if item["name"] == name:
+            return item
+    raise WorkflowFailure(
+        f"{level_file.name} lacks {category} entry {name}: "
+        f"{[i['name'] for i in data.get(category) or []]}"
+    )
+
+
+def _run_runner(output, evidence, context, name, content):
+    runner = output / f"{name}.lean"
+    runner.write_text(content, encoding="utf-8")
+    return _run_stage(
+        f"runner-{name}",
+        ["lake", "env", "lean", runner.name],
+        output,
+        600,
+        evidence,
+        context,
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("split_worlds", [False, True])
+def test_staged_definitions_full_game(tmp_path, request, record_property, split_worlds):
+    """A definition that depends on a blueprint theorem is emitted in a
+    staged ``DefsAfterNNN`` module after that theorem's level; the real
+    GameServer build must accept it and its inventory must unlock the
+    definition only after the prerequisite level."""
+    if not request.config.getoption("--run-integration"):
+        pytest.skip("requires --run-integration; network, git and Lean")
+    _assert_package_under_test()
+    source = tmp_path / "source"
+    output = tmp_path / "game"
+    _write_staged_definition_project(source, split_worlds=split_worlds)
+    evidence = _evidence_dir(tmp_path)
+    context = {"repository_url": None, "requested_sha": None, "actual_sha": None}
+    prereq_world, consumer_world = ("First", "Second") if split_worlds else ("C", "C")
+    level1_rel = f"Game/Levels/{prereq_world}/L01_helper.lean"
+    level2_rel = f"Game/Levels/{consumer_world}/L{'01' if split_worlds else '02'}_t2.lean"
+
+    generate = _run_check_and_generate(source, output, evidence, context)
+    if generate["returncode"] != 0:
+        raise _failure("proofquest generate", generate)
+
+    stage = _assert_nonempty(output, "Game/Generated/DefsAfter001.lean").read_text()
+    if f"import Game.Levels.{prereq_world}.L01_helper" not in stage:
+        raise WorkflowFailure("staged module does not import the prerequisite level")
+    if "def depval : True :=\n  helper" not in stage:
+        raise WorkflowFailure("staged module lacks the dependent definition")
+    if "theorem helper" in stage or "theorem depval" in stage:
+        raise WorkflowFailure("a target theorem leaked into a definitions module")
+    defs = _assert_nonempty(output, "Game/Generated/Defs.lean").read_text()
+    if "depval" in defs or "theorem" in defs:
+        raise WorkflowFailure("preamble anticipates the level theorem or its def")
+    level1 = _assert_nonempty(output, level1_rel).read_text()
+    if "Statement helper" not in level1 or "DefsAfter" in level1:
+        raise WorkflowFailure("prerequisite level is malformed")
+    level2 = _assert_nonempty(output, level2_rel).read_text()
+    if "import Game.Generated.DefsAfter001" not in level2:
+        raise WorkflowFailure("consuming level does not import the staged module")
+    if "NewDefinition Toy.depval" not in level2:
+        raise WorkflowFailure("consuming level does not introduce the def")
+    root = _assert_nonempty(output, "Game.lean").read_text()
+    if split_worlds and f"Dependency {prereq_world} → {consumer_world}" not in root:
+        raise WorkflowFailure("Game.lean lacks the cross-world Dependency edge")
+
+    _lake_workflow(output, evidence, context)
+
+    gamedata = output / ".lake" / "gamedata"
+    level1_file = gamedata / f"level__{prereq_world}__1.json"
+    level2_file = gamedata / f"level__{consumer_world}__{1 if split_worlds else 2}.json"
+    if not level1_file.is_file() or not level2_file.is_file():
+        raise WorkflowFailure(f"missing gamedata level files in {gamedata}")
+
+    helper_l1 = _inventory_entry(level1_file, "lemmas", "Toy.helper")
+    if not helper_l1["locked"]:
+        raise WorkflowFailure("target theorem is prematurely unlocked")
+    depval_l1 = _inventory_entry(level1_file, "definitions", "Toy.depval")
+    if depval_l1["new"] or not depval_l1["locked"]:
+        raise WorkflowFailure("dependent definition available before its stage")
+
+    helper_l2 = _inventory_entry(level2_file, "lemmas", "Toy.helper")
+    if helper_l2["locked"]:
+        raise WorkflowFailure("target theorem not unlocked after its level")
+    if not split_worlds and not helper_l2.get("proven"):
+        raise WorkflowFailure("target theorem not marked proven after its level")
+    depval_l2 = _inventory_entry(level2_file, "definitions", "Toy.depval")
+    if depval_l2["locked"] or not depval_l2["new"]:
+        raise WorkflowFailure("dependent definition not introduced at consumer")
+
+    game_data = json.loads((gamedata / "game.json").read_text())
+    if split_worlds:
+        edges = [list(edge) for edge in game_data["worlds"]["edges"]]
+        if [prereq_world, consumer_world] not in edges:
+            raise WorkflowFailure(
+                f"world dependency graph {edges} does not order "
+                f"{prereq_world} before {consumer_world}"
+            )
+
+    consumer_level_id = 1 if split_worlds else 2
+    target_self = _run_runner(
+        output, evidence, context, "RunnerSelfUse",
+        "import Game\n\n"
+        f'Runner "MyGame" "{prereq_world}" 1 (difficulty := 2) '
+        '(inventory := ["exact"]) := by\n  exact helper\n',
+    )
+    if target_self["returncode"] == 0:
+        raise WorkflowFailure("Runner accepted the target theorem at its own level")
+    runner_log = target_self["stdout"] + target_self["stderr"]
+    if "helper" not in runner_log or "unlocked" not in runner_log:
+        raise WorkflowFailure(
+            "Runner rejection does not report the locked target: " + runner_log
+        )
+    consumer = _run_runner(
+        output, evidence, context, "RunnerConsumer",
+        "import Game\n\n"
+        f'Runner "MyGame" "{consumer_world}" {consumer_level_id} '
+        '(difficulty := 2) (inventory := []) := by\n'
+        "  exact depval\n",
+    )
+    if consumer["returncode"] != 0:
+        raise _failure("runner consumer level", consumer)
+    consumer_theorem = _run_runner(
+        output, evidence, context, "RunnerConsumerTheorem",
+        "import Game\n\n"
+        f'Runner "MyGame" "{consumer_world}" {consumer_level_id} '
+        '(difficulty := 2) (inventory := []) := by\n'
+        "  exact helper\n",
+    )
+    if consumer_theorem["returncode"] != 0:
+        raise _failure("runner consumer theorem", consumer_theorem)
+
+
 @pytest.mark.integration
 def test_banach_steinhaus_full_game(tmp_path, request, record_property):
     if not request.config.getoption("--run-integration"):

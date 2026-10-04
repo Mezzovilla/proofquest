@@ -10,6 +10,7 @@ from proofquest.generator import (
     _strip_accessor_suffix,
     _theorem_refs_in_proof,
     build_game,
+    write_game,
 )
 
 MAX_GT_MEAN_PROOF = """
@@ -310,10 +311,11 @@ def test_definition_dependencies_are_copied_first():
     assert [d.full_name for d in level.new_definitions] == ["Toy.A", "Toy.B"]
 
 
-def test_definition_depending_on_blueprint_theorem_is_error():
-    """A copied def referencing a blueprint theorem would dangle in
-    Defs.lean (the theorem becomes a `Statement` level, not a copied decl);
-    it must fail loudly, naming the definition label and the theorem."""
+def test_definition_depending_on_blueprint_theorem_is_staged():
+    """A copied def referencing a blueprint theorem cannot live in the
+    preamble (the theorem only exists once its `Statement` level file is
+    imported): it is staged into a ``DefsAfterNNN`` module emitted after
+    that level, and introduced to the inventory at the consuming level."""
     helper = _theorem_node("lem:helper", 1)
     helper.lean_names = ["helper_lemma"]
     blueprint = Blueprint(
@@ -332,17 +334,20 @@ def test_definition_depending_on_blueprint_theorem_is_error():
         "t": _decl(name="t", full_name="t", proof="by exact trivial"),
     }
 
-    with pytest.raises(GenerationError) as exc_info:
-        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
-    message = str(exc_info.value)
-    assert "def:b" in message
-    assert "helper_lemma" in message
-    assert "Toy.B" in message
-    assert "\\uses" not in message
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    assert [stage.index for stage in game.stages] == [0, 1]
+    assert [d.full_name for d, _ in game.stages[0].definitions] == []
+    assert [d.full_name for d, _ in game.stages[1].definitions] == ["Toy.B"]
+    assert game.stages[1].level.file_stem == "L01_helper_lemma"
+    level_t = game.worlds[0].levels[1]
+    assert level_t.node.label == "lem:t"
+    assert [d.full_name for d in level_t.new_definitions] == ["Toy.B"]
 
 
-def test_definition_transitive_blueprint_theorem_dep_is_error():
-    """The same failure must fire through an intermediate copied decl."""
+def test_definition_transitive_blueprint_theorem_dep_is_staged():
+    """The staging works through an intermediate copied decl, with the
+    intermediate declaration emitted before its dependent in the stage."""
     helper = _theorem_node("lem:helper", 1)
     helper.lean_names = ["helper_lemma"]
     blueprint = Blueprint(
@@ -364,13 +369,14 @@ def test_definition_transitive_blueprint_theorem_dep_is_error():
         "t": _decl(name="t", full_name="t", proof="by exact trivial"),
     }
 
-    with pytest.raises(GenerationError) as exc_info:
-        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
-    message = str(exc_info.value)
-    assert "def:b" in message
-    assert "helper_lemma" in message
-    assert "Toy.mid" in message
-    assert "\\uses" not in message
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    assert [stage.index for stage in game.stages] == [0, 1]
+    assert [d.full_name for d, _ in game.stages[0].definitions] == []
+    assert [d.full_name for d, _ in game.stages[1].definitions] == [
+        "Toy.mid",
+        "Toy.B",
+    ]
 
 
 def test_source_refs_resolve_root_qualified_names():
@@ -553,10 +559,10 @@ def test_field_notation_val_resolves_real_decl_before_accessor_stripping():
     assert copied == ["Solution", "Solution.val", "Toy.spec"]
 
 
-def test_field_notation_dep_on_blueprint_theorem_is_error():
+def test_field_notation_dep_on_blueprint_theorem_is_staged():
     """`S.two_le_multiplicity` (dot notation on `S : Solution`) resolves to
-    the blueprint theorem `Solution.two_le_multiplicity`; a copied def
-    depending on a level theorem would dangle, so it must fail by name."""
+    the blueprint theorem `Solution.two_le_multiplicity`; the copied def is
+    staged after that level while the receiver type stays in the preamble."""
     helper = _theorem_node("lem:mult", 1)
     helper.lean_names = ["Solution.two_le_multiplicity"]
     blueprint = Blueprint(
@@ -584,12 +590,12 @@ def test_field_notation_dep_on_blueprint_theorem_is_error():
         "t": _decl(name="t", full_name="t", proof="by exact trivial"),
     }
 
-    with pytest.raises(GenerationError) as exc_info:
-        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
-    message = str(exc_info.value)
-    assert "def:b" in message
-    assert "Toy.B" in message
-    assert "Solution.two_le_multiplicity" in message
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    assert [stage.index for stage in game.stages] == [0, 1]
+    assert [d.full_name for d, _ in game.stages[0].definitions] == ["Solution"]
+    assert [d.full_name for d, _ in game.stages[1].definitions] == ["Toy.B"]
+    assert game.stages[1].level.file_stem == "L01_two_le_multiplicity"
 
 
 def test_field_notation_untyped_receiver_is_named_error():
@@ -712,9 +718,9 @@ def test_field_notation_quantifier_binder_types_receiver():
     assert copied == ["Solution", "Solution.y", "Toy.spec"]
 
 
-def test_field_notation_quantifier_binder_blueprint_theorem_is_error():
+def test_field_notation_quantifier_binder_blueprint_theorem_is_staged():
     """`∃ S : Solution, S.two_le_multiplicity` resolves to the blueprint
-    theorem just like a parenthesized binder would."""
+    theorem just like a parenthesized binder would: staged, not rejected."""
     helper = _theorem_node("lem:mult", 1)
     helper.lean_names = ["Solution.two_le_multiplicity"]
     blueprint = Blueprint(
@@ -742,11 +748,11 @@ def test_field_notation_quantifier_binder_blueprint_theorem_is_error():
         "t": _decl(name="t", full_name="t", proof="by exact trivial"),
     }
 
-    with pytest.raises(GenerationError) as exc_info:
-        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
-    message = str(exc_info.value)
-    assert "def:spec" in message
-    assert "Solution.two_le_multiplicity" in message
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    assert [stage.index for stage in game.stages] == [0, 1]
+    assert [d.full_name for d, _ in game.stages[0].definitions] == ["Solution"]
+    assert [d.full_name for d, _ in game.stages[1].definitions] == ["Toy.spec"]
 
 
 def test_field_notation_project_type_missing_target_is_named_error():
@@ -1010,3 +1016,498 @@ def test_build_game_reuses_same_chapter_and_keeps_non_conflicting_worlds():
         ("Different", "Different"),
     ]
     assert [len(world.levels) for world in game.worlds] == [2, 1]
+
+
+def _staged_depexample():
+    """helper level -> staged def depending on it -> consumer level."""
+    helper = _theorem_node("lem:h", 0)
+    helper.lean_names = ["helper"]
+    blueprint = Blueprint(
+        nodes=[
+            helper,
+            _def_node("def:dv", ["Toy.depval"], 1),
+            _theorem_node("lem:t2", 2, uses=["def:dv"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "helper": _decl(name="helper", full_name="helper",
+                        proof="by trivial",
+                        source_text="theorem helper : True := by\n  trivial"),
+        "Toy.depval": _decl(
+            keyword="def", name="depval", full_name="Toy.depval",
+            namespace="Toy", signature=": True",
+            source_text="def depval : True :=\n  helper",
+        ),
+        "t2": _decl(name="t2", full_name="t2",
+                    signature=": Toy.depval = Toy.depval",
+                    proof="by rfl",
+                    source_text="theorem t2 : Toy.depval = Toy.depval := by\n  rfl"),
+    }
+    return blueprint, decls
+
+
+def test_target_signature_depending_aux_is_staged_before_consumer():
+    """A theorem whose *signature* mentions a staged definition forces the
+    derived ordering: the def's stage must precede the consumer level."""
+    blueprint, decls = _staged_depexample()
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    assert [stage.index for stage in game.stages] == [0, 1]
+    assert [d.full_name for d, _ in game.stages[1].definitions] == ["Toy.depval"]
+    helper_level, t2_level = game.worlds[0].levels
+    assert helper_level.node.label == "lem:h"
+    assert t2_level.node.label == "lem:t2"
+    assert [d.full_name for d in t2_level.new_definitions] == ["Toy.depval"]
+
+
+def test_staged_write_game_emits_module_imported_by_next_level(tmp_path):
+    """The emitted files wire the staged module after its prerequisite
+    level: the level right after it imports it, the preamble stays clean
+    of the staged declaration, and no theorem proof leaks anywhere."""
+    blueprint, decls = _staged_depexample()
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    written = write_game(game, tmp_path)
+    names = {str(p.relative_to(tmp_path)) for p in written}
+
+    assert "Game/Generated/DefsAfter001.lean" in names
+    defs = (tmp_path / "Game/Generated/Defs.lean").read_text()
+    assert "depval" not in defs
+    assert "theorem" not in defs
+    stage = (tmp_path / "Game/Generated/DefsAfter001.lean").read_text()
+    assert "import Game.Levels.Ch.L01_helper" in stage
+    assert "import GameServer.Commands" in stage
+    assert "def depval : True :=\n  helper" in stage
+    assert 'DefinitionDoc Toy.depval as "depval"' in stage
+    level1 = (tmp_path / "Game/Levels/Ch/L01_helper.lean").read_text()
+    assert "Statement helper" in level1
+    assert "DefsAfter" not in level1
+    level2 = (tmp_path / "Game/Levels/Ch/L02_t2.lean").read_text()
+    assert "import Game.Generated.DefsAfter001" in level2
+    assert "Statement t2 : Toy.depval = Toy.depval" in level2
+    assert "NewDefinition Toy.depval" in level2
+    for path in written:
+        text = path.read_text()
+        assert "axiom" not in text
+        assert "sorry" not in text
+        assert "theorem helper : True := by" not in text.replace(
+            "Statement helper", ""
+        )
+
+
+def test_mixed_def_level_cycle_is_diagnosed_before_output(tmp_path):
+    """def B references the level theorem `t2` while `t2`'s signature needs
+    `B`: a genuine mixed cycle, reported with the full chain and origins —
+    before any file is written and without suggesting a def conversion."""
+    helper = _theorem_node("lem:t2", 0)
+    helper.lean_names = ["t2"]
+    blueprint = Blueprint(
+        nodes=[helper, _def_node("def:b", ["Toy.B"], 1)],
+        chapters=["Ch"],
+    )
+    decls = {
+        "t2": _decl(
+            name="t2", full_name="t2",
+            signature=": Toy.B = Toy.B", proof="by rfl",
+            source_text="theorem t2 : Toy.B = Toy.B := by\n  rfl",
+            source_path="Basic.lean", line=6,
+        ),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            signature=": Nat",
+            source_text="def B : Nat :=\n  if t2 then 1 else 2",
+            source_path="Basic.lean", line=2,
+        ),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "cycle" in message
+    assert "Toy.B" in message
+    assert "t2" in message
+    assert "Basic.lean" in message
+    assert "restate" not in message
+    assert not any(tmp_path.iterdir())
+
+
+def test_target_proof_self_reference_is_not_a_false_cycle():
+    """A target whose proof text mentions itself (or a placeholder shaped
+    like it) must not constrain its own level ordering."""
+    node = _theorem_node("lem:t", 0)
+    node.lean_names = ["t"]
+    blueprint = Blueprint(nodes=[node], chapters=["Ch"])
+    decls = {
+        "t": _decl(
+            name="t", full_name="t",
+            signature=": True", proof="by exact t",
+            source_text="theorem t : True := by\n  exact t",
+        ),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    assert len(game.worlds[0].levels) == 1
+
+
+def test_staged_def_after_last_level_stays_reachable(tmp_path):
+    """A staged definition consumed by no level still has a reachable
+    module: when no later level exists to import the stage, the game root
+    imports it so nothing dangles silently."""
+    helper = _theorem_node("lem:h", 0)
+    helper.lean_names = ["helper"]
+    blueprint = Blueprint(
+        nodes=[helper, _def_node("def:b", ["Toy.B"], 1)],
+        chapters=["Ch"],
+    )
+    decls = {
+        "helper": _decl(name="helper", full_name="helper",
+                        proof="by trivial",
+                        source_text="theorem helper : True := by\n  trivial"),
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B",
+                       namespace="Toy",
+                       source_text="def B : Nat :=\n  if helper then 1 else 2"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    assert [stage.index for stage in game.stages] == [0, 1]
+    assert game.stages[1].level is game.worlds[0].levels[0]
+    written = write_game(game, tmp_path)
+    names = {str(p.relative_to(tmp_path)) for p in written}
+    assert "Game/Generated/DefsAfter001.lean" in names
+    root = (tmp_path / "Game.lean").read_text()
+    assert "import Game.Generated.DefsAfter001" in root
+
+
+def test_staged_definition_across_worlds(tmp_path):
+    """The dependent def's consumer lives in a different world than the
+    prerequisite level: ordering still holds because levels chain across
+    worlds, and the consuming level imports the stage directly."""
+    helper = _theorem_node("lem:h", 0)
+    helper.lean_names = ["helper"]
+    helper.chapter = "First"
+    consumer = _theorem_node("lem:t2", 2, uses=["def:b"])
+    consumer.chapter = "Second"
+    blueprint = Blueprint(
+        nodes=[helper, _def_node("def:b", ["Toy.B"], 1), consumer],
+        chapters=["First", "Second"],
+    )
+    decls = {
+        "helper": _decl(name="helper", full_name="helper",
+                        proof="by trivial",
+                        source_text="theorem helper : True := by\n  trivial"),
+        "Toy.B": _decl(keyword="def", name="B", full_name="Toy.B",
+                       namespace="Toy",
+                       source_text="def B : Nat :=\n  if helper then 1 else 2"),
+        "t2": _decl(name="t2", full_name="t2",
+                    signature=": True", proof="by trivial",
+                    source_text="theorem t2 : True := by\n  trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    assert [w.world_id for w in game.worlds] == ["First", "Second"]
+    write_game(game, tmp_path)
+    stage = (tmp_path / "Game/Generated/DefsAfter001.lean").read_text()
+    assert "import Game.Levels.First.L01_helper" in stage
+    level2 = (
+        tmp_path / "Game/Levels/Second/L01_t2.lean"
+    ).read_text()
+    assert "import Game.Levels.First.L01_helper" in level2
+    assert "import Game.Generated.DefsAfter001" in level2
+    assert "NewDefinition Toy.B" in level2
+
+
+def test_staged_generation_is_deterministic(tmp_path):
+    blueprint, decls = _staged_depexample()
+    out1, out2 = tmp_path / "g1", tmp_path / "g2"
+    game1 = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    write_game(game1, out1)
+    game2 = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    write_game(game2, out2)
+    files1 = {str(p.relative_to(out1)) for p in out1.rglob("*") if p.is_file()}
+    files2 = {str(p.relative_to(out2)) for p in out2.rglob("*") if p.is_file()}
+    assert files1 == files2
+    for rel in files1:
+        assert (out1 / rel).read_bytes() == (out2 / rel).read_bytes()
+
+
+def _world_node(label, chapter, order, uses=()):
+    node = _theorem_node(label, order, uses=uses)
+    node.chapter = chapter
+    return node
+
+
+def test_independent_interleaved_worlds_regroup_safely(tmp_path):
+    """Worlds may reorder when a theorem prerequisite crosses chapter
+    boundaries: A:a1, B:b1, A:a2 with a2 needing b1 emits B before A and
+    records the world dependency instead of interleaving positions."""
+    a1 = _world_node("lem:a1", "A", 0)
+    a1.lean_names = ["Toy.a1"]
+    b1 = _world_node("lem:b1", "B", 1)
+    b1.lean_names = ["Toy.b1"]
+    dv = _def_node("def:dv", ["Toy.dv"], 2)
+    dv.chapter = "A"
+    a2 = _world_node("lem:a2", "A", 3, uses=["def:dv"])
+    a2.lean_names = ["Toy.a2"]
+    blueprint = Blueprint(nodes=[a1, b1, dv, a2], chapters=["A", "B"])
+    decls = {
+        "Toy.a1": _decl(
+            name="a1", full_name="Toy.a1", namespace="Toy",
+            signature=": True", proof="by trivial",
+            source_text="theorem a1 : True := by\n  trivial",
+        ),
+        "Toy.b1": _decl(
+            name="b1", full_name="Toy.b1", namespace="Toy",
+            signature=": True", proof="by trivial",
+            source_text="theorem b1 : True := by\n  trivial",
+        ),
+        "Toy.dv": _decl(
+            keyword="def", name="dv", full_name="Toy.dv", namespace="Toy",
+            signature=": True",
+            source_text="def dv : True :=\n  b1",
+        ),
+        "Toy.a2": _decl(
+            name="a2", full_name="Toy.a2", namespace="Toy",
+            signature=": dv = dv", proof="by rfl",
+            source_text="theorem a2 : dv = dv := by\n  rfl",
+        ),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    assert [w.world_id for w in game.worlds] == ["B", "A"]
+    assert game.world_dependencies == [("B", "A")]
+    flat = [level.node.label for w in game.worlds for level in w.levels]
+    assert flat == ["lem:b1", "lem:a1", "lem:a2"]
+
+    write_game(game, tmp_path)
+    root = (tmp_path / "Game.lean").read_text()
+    assert "Dependency B → A" in root
+    stage = (tmp_path / "Game/Generated/DefsAfter001.lean").read_text()
+    assert "import Game.Levels.B.L01_b1" in stage
+    assert "def dv : True :=\n  b1" in stage
+    level_a1 = (tmp_path / "Game/Levels/A/L01_a1.lean").read_text()
+    assert "import Game.Levels.B.L01_b1" in level_a1
+    assert "import Game.Generated.DefsAfter001" in level_a1
+    level_a2 = (tmp_path / "Game/Levels/A/L02_a2.lean").read_text()
+    assert "Statement a2" in level_a2
+    assert "NewDefinition Toy.dv" in level_a2
+
+
+def test_cyclic_world_layout_is_diagnosed_before_output(tmp_path):
+    """A:a1 -> B:b1 -> A:a2 through a dependent definition is impossible
+    for a grouped layout: the world DAG is cyclic, so generation fails
+    with the witnessing chain instead of emitting inconsistent output."""
+    a1 = _world_node("lem:a1", "A", 0)
+    a1.lean_names = ["Toy.a1"]
+    b1 = _world_node("lem:b1", "B", 1)
+    b1.lean_names = ["Toy.b1"]
+    dv = _def_node("def:dv", ["Toy.dv"], 2)
+    dv.chapter = "A"
+    a2 = _world_node("lem:a2", "A", 3, uses=["def:dv"])
+    a2.lean_names = ["Toy.a2"]
+    blueprint = Blueprint(nodes=[a1, b1, dv, a2], chapters=["A", "B"])
+    decls = {
+        "Toy.a1": _decl(
+            name="a1", full_name="Toy.a1", namespace="Toy",
+            signature=": True", proof="by trivial",
+            source_text="theorem a1 : True := by\n  trivial",
+            source_path="Basic.lean", line=1,
+        ),
+        "Toy.b1": _decl(
+            name="b1", full_name="Toy.b1", namespace="Toy",
+            signature=": True", proof="by exact a1",
+            source_text="theorem b1 : True := by\n  exact a1",
+            source_path="Basic.lean", line=4,
+        ),
+        "Toy.dv": _decl(
+            keyword="def", name="dv", full_name="Toy.dv", namespace="Toy",
+            signature=": True",
+            source_text="def dv : True :=\n  b1",
+            source_path="Basic.lean", line=7,
+        ),
+        "Toy.a2": _decl(
+            name="a2", full_name="Toy.a2", namespace="Toy",
+            signature=": dv = dv", proof="by rfl",
+            source_text="theorem a2 : dv = dv := by\n  rfl",
+            source_path="Basic.lean", line=10,
+        ),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "grouped world" in message
+    assert "A -> B -> A" in message
+    assert "Toy.b1" in message and "Basic.lean" in message
+    assert "def:dv" in message or "lem:a2" in message
+    assert not any(tmp_path.iterdir())
+
+
+def test_cyclic_world_layout_uses_canonical_earliest_witness(tmp_path):
+    """When several same-world ancestors could witness a cross-world edge,
+    the diagnostic chain names the earliest blueprint prerequisite."""
+    a1 = _world_node("lem:a1", "A", 0)
+    a1.lean_names = ["Toy.a1"]
+    b1 = _world_node("lem:b1", "B", 1)
+    b1.lean_names = ["Toy.b1"]
+    b2 = _world_node("lem:b2", "B", 2)
+    b2.lean_names = ["Toy.b2"]
+    dv = _def_node("def:dv", ["Toy.dv"], 3)
+    dv.chapter = "A"
+    a2 = _world_node("lem:a2", "A", 4, uses=["def:dv"])
+    a2.lean_names = ["Toy.a2"]
+    blueprint = Blueprint(nodes=[a1, b1, b2, dv, a2], chapters=["A", "B"])
+    decls = {
+        "Toy.a1": _decl(
+            name="a1", full_name="Toy.a1", namespace="Toy",
+            signature=": True", proof="by trivial",
+            source_text="theorem a1 : True := by\n  trivial",
+            source_path="Basic.lean", line=1,
+        ),
+        "Toy.b1": _decl(
+            name="b1", full_name="Toy.b1", namespace="Toy",
+            signature=": True", proof="by exact a1",
+            source_text="theorem b1 : True := by\n  exact a1",
+            source_path="Basic.lean", line=4,
+        ),
+        "Toy.b2": _decl(
+            name="b2", full_name="Toy.b2", namespace="Toy",
+            signature=": True", proof="by exact a1",
+            source_text="theorem b2 : True := by\n  exact a1",
+            source_path="Basic.lean", line=6,
+        ),
+        "Toy.dv": _decl(
+            keyword="def", name="dv", full_name="Toy.dv", namespace="Toy",
+            signature=": True",
+            source_text="def dv : True :=\n  if b1 then b2 else b2",
+            source_path="Basic.lean", line=8,
+        ),
+        "Toy.a2": _decl(
+            name="a2", full_name="Toy.a2", namespace="Toy",
+            signature=": dv = dv", proof="by rfl",
+            source_text="theorem a2 : dv = dv := by\n  rfl",
+            source_path="Basic.lean", line=11,
+        ),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "A -> B -> A" in message
+    assert "[lem:b1] -> Toy.a2" in message
+    assert "[lem:b2] -> Toy.a2" not in message
+
+
+def test_uses_definition_reorders_consumer_after_its_prerequisite(tmp_path):
+    """T \\uses a definition whose own closure needs theorem U: U must be
+    emitted before T even though T's source never mentions it, and the
+    definition is introduced at T's level."""
+    consumer = _world_node("lem:t", "Ch", 0, uses=["def:dv"])
+    consumer.lean_names = ["Toy.t"]
+    dv = _def_node("def:dv", ["Toy.dv"], 1)
+    u = _world_node("lem:u", "Ch", 2)
+    u.lean_names = ["Toy.u"]
+    blueprint = Blueprint(nodes=[consumer, dv, u], chapters=["Ch"])
+    decls = {
+        "Toy.t": _decl(
+            name="t", full_name="Toy.t", namespace="Toy",
+            signature=": True", proof="by trivial",
+            source_text="theorem t : True := by\n  trivial",
+        ),
+        "Toy.dv": _decl(
+            keyword="def", name="dv", full_name="Toy.dv", namespace="Toy",
+            signature=": True",
+            source_text="def dv : True :=\n  u",
+        ),
+        "Toy.u": _decl(
+            name="u", full_name="Toy.u", namespace="Toy",
+            signature=": True", proof="by trivial",
+            source_text="theorem u : True := by\n  trivial",
+        ),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    levels = game.worlds[0].levels
+    assert [level.node.label for level in levels] == ["lem:u", "lem:t"]
+    assert [stage.index for stage in game.stages] == [0, 1]
+    assert [d.full_name for d, _ in game.stages[1].definitions] == ["Toy.dv"]
+    assert [d.full_name for d in levels[1].new_definitions] == ["Toy.dv"]
+    write_game(game, tmp_path)
+    consumer_level = (tmp_path / "Game/Levels/Ch/L02_t.lean").read_text()
+    assert "import Game.Generated.DefsAfter001" in consumer_level
+
+
+def test_uses_chain_through_definitions_propagates(tmp_path):
+    """T uses def D1, D1 uses def D2, and D2's source needs theorem U:
+    the projected graph still yields U -> T and stages both defs."""
+    u = _world_node("lem:u", "Ch", 0)
+    u.lean_names = ["Toy.u"]
+    d2 = _def_node("def:d2", ["Toy.d2"], 1)
+    d1 = _def_node("def:d1", ["Toy.d1"], 2, uses=["def:d2"])
+    t = _world_node("lem:t", "Ch", 3, uses=["def:d1"])
+    t.lean_names = ["Toy.t"]
+    blueprint = Blueprint(nodes=[u, d2, d1, t], chapters=["Ch"])
+    decls = {
+        "Toy.u": _decl(
+            name="u", full_name="Toy.u", namespace="Toy",
+            signature=": True", proof="by trivial",
+            source_text="theorem u : True := by\n  trivial",
+        ),
+        "Toy.d2": _decl(
+            keyword="def", name="d2", full_name="Toy.d2", namespace="Toy",
+            signature=": True",
+            source_text="def d2 : True :=\n  u",
+        ),
+        "Toy.d1": _decl(
+            keyword="def", name="d1", full_name="Toy.d1", namespace="Toy",
+            signature=": True",
+            source_text="def d1 : True :=\n  d2",
+        ),
+        "Toy.t": _decl(
+            name="t", full_name="Toy.t", namespace="Toy",
+            signature=": d1 = d1", proof="by rfl",
+            source_text="theorem t : d1 = d1 := by\n  rfl",
+        ),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    assert [level.node.label for level in game.worlds[0].levels] == [
+        "lem:u",
+        "lem:t",
+    ]
+    staged = {
+        d.full_name for stage in game.stages[1:] for d, _ in stage.definitions
+    }
+    assert staged == {"Toy.d1", "Toy.d2"}
+    write_game(game, tmp_path)
+    stage = (tmp_path / "Game/Generated/DefsAfter001.lean").read_text()
+    assert stage.index("def d2") < stage.index("def d1")
+
+
+def test_unique_target_statement_across_generated_files(tmp_path):
+    """Each target appears as exactly one `Statement` in exactly one level
+    file, and no generated module contains the target proof text or a
+    `theorem`/`axiom`/`sorry` substitute."""
+    blueprint, decls = _staged_depexample()
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    write_game(game, tmp_path)
+
+    lean_files = [p for p in tmp_path.rglob("*.lean")]
+    joined = {p: p.read_text() for p in lean_files}
+    for name in ("helper", "t2"):
+        statements = sum(text.count(f"Statement {name}") for text in joined.values())
+        assert statements == 1, name
+        theorems = sum(
+            text.count(f"theorem {name}") for text in joined.values()
+        )
+        assert theorems == 0, name
+    defs_sources = joined[tmp_path / "Game/Generated/Defs.lean"]
+    stage_sources = joined[tmp_path / "Game/Generated/DefsAfter001.lean"]
+    assert ":= by\n  trivial" not in defs_sources + stage_sources
+    assert joined[tmp_path / "Game/Generated/DefsAfter001.lean"].count(
+        "def depval"
+    ) == 1
+    for text in joined.values():
+        assert "axiom " not in text
+        assert "sorry" not in text
