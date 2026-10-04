@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
 from pathlib import Path
 
-from .game_model import LeanDecl
+from .game_model import LeanDecl, LeanNotation
 
 _EXCLUDED_DIRS = {
     ".lake",
@@ -43,6 +44,41 @@ _LOCAL_SYNTAX_RE = re.compile(
 _LOCAL_SYNTAX_KIND_RE = re.compile(
     r"(?:(?:local|scoped|private|protected)\s+)*([A-Za-z_][\w']*)"
 )
+
+_ASCII_IDENT = r"[A-Za-z_][A-Za-z0-9_']*"
+_QUALIFIED_IDENT = _ASCII_IDENT + r"(?:\." + _ASCII_IDENT + r")*"
+_NOTATION_RE = re.compile(r"^notation\s+(.+?)\s*=>\s*(.+)$")
+_NOTATION_TOKEN_RE = re.compile(r'"((?:\\.|[^"\\])*)"|(' + _ASCII_IDENT + r")")
+_NOTATION_TARGET_RE = re.compile(
+    r"^(_root_\.)?(" + _QUALIFIED_IDENT + r")((?:\s+" + _ASCII_IDENT + r")*)\s*$"
+)
+
+
+@dataclass(frozen=True)
+class _NotationCandidate:
+    line: int
+    namespace: str
+    pattern: str
+    target: str
+    arguments: tuple[str, ...]
+    explicit_root: bool
+
+
+@dataclass(frozen=True)
+class _LocalCommand:
+    module: str
+    line: int
+    kind: str
+    namespace: str
+    notation: _NotationCandidate | None
+
+
+@dataclass(frozen=True)
+class _ModuleContext:
+    commands: tuple[_LocalCommand, ...]
+    project_imports: tuple[str, ...]
+    external_imports: tuple[str, ...]
+
 
 _BOUNDARY_RE = re.compile(
     r"^(?:@\[|/--|--|namespace\b|end\b|section\b|open\b|variable\b|import\b|"
@@ -242,9 +278,48 @@ def _strip_comments_keep_lines(text: str) -> str:
     return "".join(out)
 
 
+def _parse_plain_notation(
+    line: str, lineno: int, namespace: str, has_continuation: bool
+) -> _NotationCandidate | None:
+    if has_continuation:
+        return None
+    match = _NOTATION_RE.fullmatch(line)
+    if match is None:
+        return None
+    pattern, rhs = match.group(1).strip(), match.group(2).strip()
+    pos = 0
+    literal_count = 0
+    arguments: list[str] = []
+    for token in _NOTATION_TOKEN_RE.finditer(pattern):
+        if pattern[pos:token.start()].strip():
+            return None
+        if token.group(1) is not None:
+            literal_count += 1
+        else:
+            arguments.append(token.group(2))
+        pos = token.end()
+    if pattern[pos:].strip() or literal_count == 0 or len(arguments) != len(set(arguments)):
+        return None
+    target_match = _NOTATION_TARGET_RE.fullmatch(rhs)
+    if target_match is None:
+        return None
+    target = target_match.group(2)
+    target_arguments = tuple(target_match.group(3).split())
+    if target_arguments != tuple(arguments):
+        return None
+    return _NotationCandidate(
+        line=lineno,
+        namespace=namespace,
+        pattern=pattern,
+        target=target,
+        arguments=tuple(arguments),
+        explicit_root=target_match.group(1) is not None,
+    )
+
+
 def _module_local_commands(
-    path: Path, project_modules: AbstractSet[str]
-) -> tuple[list[tuple[int, str]], list[str]]:
+    path: Path, module: str, project_modules: AbstractSet[str]
+) -> _ModuleContext:
     """``((line, command kind) list, project module imports)`` of one file.
 
     Complements ``_parse_file`` (which only sees files through their
@@ -254,64 +329,224 @@ def _module_local_commands(
     not file context, so it is ignored.
     """
     text = _strip_comments_keep_lines(path.read_text(encoding="utf-8"))
-    syntax: list[tuple[int, str]] = []
+    commands: list[_LocalCommand] = []
     project_imports: list[str] = []
-    for lineno, line in enumerate(text.splitlines()):
+    external_imports: list[str] = []
+    namespace = ""
+    ns_stack: list[tuple[str, str]] = []
+    raw_lines = text.splitlines()
+    for lineno, line in enumerate(raw_lines):
         stripped = line.strip()
         if stripped.startswith("import "):
-            module = stripped.removeprefix("import ").strip()
-            if module in project_modules:
-                project_imports.append(module)
+            imported_module = stripped.removeprefix("import ").strip()
+            if imported_module in project_modules:
+                project_imports.append(imported_module)
+            else:
+                external_imports.append(imported_module)
+            continue
+        if stripped.startswith("namespace "):
+            name = stripped.removeprefix("namespace ").strip()
+            ns_stack.append(("ns", name))
+            namespace = ".".join(
+                part for kind, part in ns_stack if kind == "ns" and part
+            )
+            continue
+        if stripped == "section" or stripped.startswith("section "):
+            ns_stack.append(("sec", ""))
+            continue
+        if stripped == "end" or stripped.startswith("end "):
+            if ns_stack:
+                ns_stack.pop()
+            namespace = ".".join(
+                part for kind, part in ns_stack if kind == "ns" and part
+            )
             continue
         match = _LOCAL_SYNTAX_RE.match(stripped)
         if match:
             kind = _LOCAL_SYNTAX_KIND_RE.match(stripped).group(1)
             if kind == "set_option" and re.search(r"(?:^|\s)in(?:\s|$)", stripped):
                 continue
-            syntax.append((lineno, kind))
-    return syntax, project_imports
+            next_line = next(
+                (raw_lines[k] for k in range(lineno + 1, len(raw_lines)) if raw_lines[k].strip()),
+                "",
+            )
+            has_continuation = bool(next_line and next_line[:1].isspace())
+            commands.append(
+                _LocalCommand(
+                    module=module,
+                    line=lineno,
+                    kind=kind,
+                    namespace=namespace,
+                    notation=(
+                        _parse_plain_notation(stripped, lineno, namespace, has_continuation)
+                        if stripped.startswith("notation ")
+                        else None
+                    ),
+                )
+            )
+    return _ModuleContext(
+        commands=tuple(commands),
+        project_imports=tuple(project_imports),
+        external_imports=tuple(external_imports),
+    )
+
+
+def _module_context(
+    module: str,
+    contexts: dict[str, _ModuleContext],
+    own_upto_line: int,
+) -> list[_LocalCommand]:
+    ordered: list[_LocalCommand] = []
+    seen: set[str] = set()
+
+    def visit(current: str, own: bool) -> None:
+        if current in seen:
+            return
+        seen.add(current)
+        context = contexts.get(current)
+        if context is None:
+            return
+        for imported in context.project_imports:
+            visit(imported, False)
+        for command in context.commands:
+            if not own or command.line < own_upto_line:
+                ordered.append(command)
+
+    visit(module, True)
+    return ordered
+
+
+def _canonical_notation_pattern(pattern: str) -> tuple[tuple[str, str], ...]:
+    tokens: list[tuple[str, str]] = []
+    argument = 0
+    for match in _NOTATION_TOKEN_RE.finditer(pattern):
+        if match.group(1) is None:
+            argument += 1
+            tokens.append(("argument", str(argument)))
+        else:
+            tokens.append(("literal", match.group(1)))
+    return tuple(tokens)
+
+
+def _resolve_notation_target(
+    notation: _NotationCandidate, decls: dict[str, LeanDecl]
+) -> str | None:
+    candidates = []
+    if notation.explicit_root:
+        candidates.append(notation.target)
+    else:
+        if notation.namespace:
+            parts = notation.namespace.split(".")
+            for i in range(len(parts), 0, -1):
+                candidates.append(".".join(parts[:i]) + "." + notation.target)
+        candidates.append(notation.target)
+    for candidate in candidates:
+        decl = decls.get(candidate)
+        if decl is not None:
+            return decl.full_name if decl.is_definition else None
+    return None
 
 
 def _module_local_syntax(
     module: str,
-    commands: dict[str, tuple[list[tuple[int, str]], list[str]]],
-    own_upto_line: int | None = None,
-) -> list[str]:
-    """Command kinds of the project-local syntax context for ``module``.
-
-    The module's own commands count only up to ``own_upto_line`` (a command
-    cannot affect declarations earlier in the file); transitively imported
-    project modules contribute all of theirs, since their commands are
-    elaborated at import time.
-    """
-    seen: set[str] = set()
-    ordered: list[str] = []
-    stack = [module]
-    first = True
-    while stack:
-        current = stack.pop()
-        if current in seen:
+    contexts: dict[str, _ModuleContext],
+    decls: dict[str, LeanDecl],
+    own_upto_line: int,
+) -> tuple[list[str], list[LeanNotation]]:
+    syntax: list[str] = []
+    notations: list[LeanNotation] = []
+    patterns: dict[tuple[tuple[str, str], ...], str] = {}
+    ambiguous = False
+    for command in _module_context(module, contexts, own_upto_line):
+        if command.kind != "notation" or command.notation is None:
+            if command.kind not in syntax:
+                syntax.append(command.kind)
             continue
-        seen.add(current)
-        syntax, imports = commands.get(current, ([], []))
-        for lineno, kind in syntax:
-            if first and own_upto_line is not None and lineno >= own_upto_line:
-                continue
-            if kind not in ordered:
-                ordered.append(kind)
-        first = False
-        stack.extend(reversed(imports))
-    return ordered
+        target = _resolve_notation_target(command.notation, decls)
+        if target is None:
+            if command.kind not in syntax:
+                syntax.append(command.kind)
+            continue
+        key = _canonical_notation_pattern(command.notation.pattern)
+        previous = patterns.get(key)
+        if previous is not None:
+            if previous != target:
+                ambiguous = True
+            continue
+        patterns[key] = target
+        notation = LeanNotation(
+            module=command.module,
+            line=command.line,
+            namespace=command.notation.namespace,
+            pattern=command.notation.pattern,
+            target=target,
+            arguments=command.notation.arguments,
+        )
+        if notation not in notations:
+            notations.append(notation)
+    if ambiguous and "notation" not in syntax:
+        syntax.append("notation")
+    return syntax, notations
+
+
+def _generated_roots(project_dir: Path) -> list[Path]:
+    roots: list[Path] = []
+    for game_root in sorted(
+        path for path in project_dir.rglob("Game.lean") if path.is_file()
+    ):
+        root = game_root.parent
+        markers = (
+            root / "Game" / "Metadata.lean",
+            root / "Game" / "Generated" / "Defs.lean",
+            root / "lakefile.lean",
+            root / "lean-toolchain",
+        )
+        if not all(marker.is_file() for marker in markers):
+            continue
+        if "MakeGame" in game_root.read_text(encoding="utf-8", errors="replace"):
+            roots.append(root)
+    return roots
+
+
+def _module_external_imports(
+    contexts: dict[str, _ModuleContext]
+) -> dict[str, list[str]]:
+    resolved: dict[str, list[str]] = {}
+    visiting: set[str] = set()
+
+    def visit(module: str) -> list[str]:
+        if module in resolved:
+            return resolved[module]
+        if module in visiting:
+            return []
+        visiting.add(module)
+        context = contexts.get(module)
+        imports = list(context.external_imports) if context else []
+        if context:
+            for imported in context.project_imports:
+                for external in visit(imported):
+                    if external not in imports:
+                        imports.append(external)
+        visiting.remove(module)
+        resolved[module] = imports
+        return imports
+
+    for module in contexts:
+        visit(module)
+    return resolved
 
 
 def parse_project(project_dir: Path, exclude: tuple[Path, ...] = ()) -> dict[str, LeanDecl]:
     """Parse every Lean source file of the project, keyed by full name."""
     project_dir = project_dir.resolve()
     excluded = tuple(path.resolve() for path in exclude)
+    generated_roots = _generated_roots(project_dir)
     decls: dict[str, LeanDecl] = {}
     source_files: list[Path] = []
     for path in sorted(project_dir.rglob("*.lean")):
         if any(path.is_relative_to(directory) for directory in excluded):
+            continue
+        if any(path.is_relative_to(directory) for directory in generated_roots):
             continue
         relative_parts = path.relative_to(project_dir).parts
         if any(part in _EXCLUDED_DIRS for part in relative_parts):
@@ -321,15 +556,23 @@ def parse_project(project_dir: Path, exclude: tuple[Path, ...] = ()) -> dict[str
         ".".join(path.relative_to(project_dir).with_suffix("").parts)
         for path in source_files
     }
-    commands = {
-        ".".join(path.relative_to(project_dir).with_suffix("").parts):
-            _module_local_commands(path, project_modules)
-        for path in source_files
-    }
+    contexts = {}
     for path in source_files:
         module = ".".join(path.relative_to(project_dir).with_suffix("").parts)
-        for decl in _parse_file(path, project_modules):
+        contexts[module] = _module_local_commands(path, module, project_modules)
+    external_imports = _module_external_imports(contexts)
+    parsed_by_module: dict[str, list[LeanDecl]] = {}
+    for path in source_files:
+        module = ".".join(path.relative_to(project_dir).with_suffix("").parts)
+        module_decls = _parse_file(path, project_modules)
+        for decl in module_decls:
             decl.module = module
-            decl.local_syntax = _module_local_syntax(module, commands, decl.line)
+            decl.imports = external_imports.get(module, decl.imports)
             decls[decl.full_name] = decl
+        parsed_by_module[module] = module_decls
+    for module, module_decls in parsed_by_module.items():
+        for decl in module_decls:
+            decl.local_syntax, decl.notations = _module_local_syntax(
+                module, contexts, decls, decl.line
+            )
     return decls

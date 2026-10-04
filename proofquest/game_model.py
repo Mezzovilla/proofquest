@@ -40,6 +40,16 @@ class Blueprint:
         return {n.label: n for n in self.nodes}
 
 
+@dataclass(frozen=True)
+class LeanNotation:
+    module: str
+    line: int
+    namespace: str
+    pattern: str
+    target: str
+    arguments: tuple[str, ...]
+
+
 @dataclass
 class LeanDecl:
     """One declaration extracted from the Lean sources of the input project."""
@@ -57,6 +67,7 @@ class LeanDecl:
     module: str = ""
     line: int = 0
     local_syntax: list[str] = field(default_factory=list)
+    notations: list[LeanNotation] = field(default_factory=list)
 
     @property
     def is_definition(self) -> bool:

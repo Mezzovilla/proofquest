@@ -435,6 +435,12 @@ def _source_refs(decl: LeanDecl, decls: dict[str, LeanDecl]) -> list[LeanDecl]:
     bound.add(decl.name)
     bound.add(decl.full_name)
     refs: list[LeanDecl] = []
+    seen_refs: set[str] = set()
+    for notation in decl.notations:
+        dep = decls.get(notation.target)
+        if dep is not None and dep is not decl:
+            refs.append(dep)
+            seen_refs.add(dep.full_name)
     seen: set[str] = set()
     for match in _IDENT_RE.finditer(text):
         raw = match.group(0)
@@ -455,8 +461,9 @@ def _source_refs(decl: LeanDecl, decls: dict[str, LeanDecl]) -> list[LeanDecl]:
             )
         else:
             dep = _resolve_project_decl(name.removeprefix("_root_."), decl, decls)
-        if dep is not None and dep is not decl:
+        if dep is not None and dep is not decl and dep.full_name not in seen_refs:
             refs.append(dep)
+            seen_refs.add(dep.full_name)
     return refs
 
 
@@ -704,6 +711,17 @@ def build_game(
     definitions: list[tuple[LeanDecl, BlueprintNode | None]] = []
     def_closure_by_label: dict[str, list[LeanDecl]] = {}
     emitted_defs: set[str] = set()
+
+    def append_definitions(
+        copied: list[LeanDecl], node: BlueprintNode, named_names: set[str]
+    ) -> None:
+        for dep in copied:
+            if dep.full_name in emitted_defs:
+                continue
+            emitted_defs.add(dep.full_name)
+            owner = node if dep.full_name in named_names else def_node_by_name.get(dep.full_name)
+            definitions.append((dep, owner))
+
     for node in order:
         if node.is_theorem:
             continue
@@ -721,16 +739,7 @@ def build_game(
         named = [decls[name] for name in node.lean_names]
         named_names = {d.full_name for d in named}
         copied = _copy_order(named, decls, theorem_names, node.label, project_scopes)
-        for dep in copied:
-            if dep.full_name in emitted_defs:
-                continue
-            emitted_defs.add(dep.full_name)
-            owner = (
-                node
-                if dep.full_name in named_names
-                else def_node_by_name.get(dep.full_name)
-            )
-            definitions.append((dep, owner))
+        append_definitions(copied, node, named_names)
         def_closure_by_label[node.label] = copied
 
     worlds: dict[str, World] = {}
@@ -769,6 +778,15 @@ def build_game(
                 "move the declaration to a module that does not rely on "
                 "project-local opens"
             )
+        notation_roots = [
+            decls[notation.target]
+            for notation in decl.notations
+            if notation.target in decls
+        ]
+        notation_copied = _copy_order(
+            notation_roots, decls, theorem_names, node.label, project_scopes
+        )
+        append_definitions(notation_copied, node, set())
         world_id = _camel(node.chapter)
         if world_id in worlds and worlds[world_id].title != node.chapter:
             raise GenerationError(
@@ -786,6 +804,10 @@ def build_game(
         world = worlds[world_id]
 
         new_defs: list[LeanDecl] = []
+        for dep in notation_copied:
+            if dep.is_definition and dep.full_name not in introduced_defs:
+                introduced_defs.add(dep.full_name)
+                new_defs.append(dep)
         for use in node.uses:
             used = by_label.get(use)
             if used is None or used.is_theorem:
@@ -918,6 +940,22 @@ def _strip_redundant_set(proof: str, signature: str) -> str:
     return body[i:].lstrip("\n")
 
 
+def _notation_block(decl: LeanDecl) -> str:
+    if not decl.notations:
+        return ""
+    lines = ["section"]
+    lines.extend(
+        " ".join(
+            (
+                f"local notation {notation.pattern} => _root_.{notation.target}",
+                *notation.arguments,
+            )
+        )
+        for notation in decl.notations
+    )
+    return "\n".join(lines) + "\n\n"
+
+
 def _statement_proof(level: Level) -> str:
     """Proof block of the Statement: sample solution with the LaTeX hint."""
     lines: list[str] = []
@@ -957,12 +995,15 @@ def _render_level(game: Game, level: Level, previous: Level | None) -> str:
     )
     var_block = "\n".join(decl.variables) + "\n\n" if decl.variables else ""
     open_block = "\n".join(decl.opens) + "\n\n" if decl.opens else ""
+    notation_block = _notation_block(decl)
+    section_end = "\n\nend" if notation_block else ""
+    body = f"{notation_block}{var_block}{open_block}{doc}\n\n{statement}{section_end}"
     if decl.namespace:
         parts.append(
-            f"namespace {decl.namespace}\n\n{var_block}{open_block}{doc}\n\n{statement}\n\nend {decl.namespace}"
+            f"namespace {decl.namespace}\n\n{body}\n\nend {decl.namespace}"
         )
     else:
-        parts.append(f"{var_block}{open_block}{doc}\n\n{statement}")
+        parts.append(body)
 
     parts.append('Conclusion "Level completed! 🎉"')
 
@@ -1021,7 +1062,11 @@ def _render_defs(game: Game) -> str:
     # Collect the union of external imports needed by all definitions.
     all_imports: list[str] = []
     seen: set[str] = set()
-    for decl, _ in game.definitions:
+    import_decls = [decl for decl, _ in game.definitions]
+    import_decls.extend(
+        level.decl for world in game.worlds for level in world.levels
+    )
+    for decl in import_decls:
         for imp in decl.imports:
             if imp not in seen:
                 seen.add(imp)
@@ -1043,10 +1088,12 @@ def _render_defs(game: Game) -> str:
             latex_to_markdown(node.statement_tex) if node else f"Definition `{decl.full_name}`."
         )
         var_block = "\n".join(decl.variables) + "\n\n" if decl.variables else ""
+        notation_block = _notation_block(decl)
+        section_end = "\n\nend" if notation_block else ""
         block = (
-            f"{var_block}{decl.source_text}\n\n"
+            f"{notation_block}{var_block}{decl.source_text}\n\n"
             f"/-- {_doc_comment(doc_md)} -/\n"
-            f'DefinitionDoc {decl.full_name} as "{decl.name}"'
+            f'DefinitionDoc {decl.full_name} as "{decl.name}"{section_end}'
         )
         if decl.namespace:
             block = f"namespace {decl.namespace}\n\n{block}\n\nend {decl.namespace}"
@@ -1055,7 +1102,7 @@ def _render_defs(game: Game) -> str:
 
 
 def _render_tactic_docs(game: Game) -> str:
-    parts = ["import GameServer.Commands"]
+    parts = ["import Game.Generated.Defs"]
     for tactic in game.tactics:
         doc = _TACTIC_DOCS.get(tactic, f"The `{tactic}` tactic.")
         parts.append(f"/-- {_doc_comment(doc)} -/\nTacticDoc {_tactic_ident(tactic)}")
@@ -1065,7 +1112,7 @@ def _render_tactic_docs(game: Game) -> str:
 def _render_theorem_docs(game: Game) -> str:
     # These are external (e.g. Mathlib) theorems referenced by sample proofs,
     # so there is no local docstring to reuse: link to the mathlib doc page.
-    parts = ["import GameServer.Commands"]
+    parts = ["import Game.Generated.Defs"]
     legacy = _legacy_doc_syntax(game.toolchain)
     for theorem in game.theorems:
         if legacy:
