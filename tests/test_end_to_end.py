@@ -150,6 +150,170 @@ def test_generate_rejects_project_open_without_writing(tmp_path, capsys):
     assert "Ks" in err
 
 
+def test_generate_replays_plain_global_notation_locally(tmp_path):
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        "import Mathlib.Topology.Basic\n\n"
+        "namespace Toy\n\n"
+        "abbrev A : Nat :=\n  1\n\n"
+        "abbrev NormMap (T : Type*) := T\n\n"
+        'notation "‖" T "·‖" => NormMap T\n\n'
+        "theorem t (T : Type*) (x : ‖T·‖) : ‖T ·‖ := by\n"
+        "  exact x\n\n"
+        "end Toy\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+
+    defs = (out / "Game" / "Generated" / "Defs.lean").read_text()
+    assert "import Mathlib.Topology.Basic" in defs
+    assert "abbrev NormMap (T : Type*) := T" in defs
+    assert "local notation" not in defs
+    level = (out / "Game" / "Levels" / "C" / "L01_t.lean").read_text()
+    assert "section\nlocal notation \"‖\" T \"·‖\" => _root_.Toy.NormMap T" in level
+    assert "Statement t (T : Type*) (x : ‖T·‖) : ‖T ·‖ := by" in level
+    assert "NewDefinition Toy.NormMap Toy.A" in level
+    assert (out / "Game" / "Generated" / "TacticDocs.lean").read_text().startswith(
+        "import Game.Generated.Defs\n"
+    )
+    assert (out / "Game" / "Generated" / "TheoremDocs.lean").read_text().startswith(
+        "import Game.Generated.Defs\n"
+    )
+
+
+def test_generate_rejects_ambiguous_imported_notation_before_writing(tmp_path, capsys):
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        "import N1\nimport N2\n\n"
+        "namespace Toy\n\n"
+        "abbrev A : Nat :=\n  1\n\n"
+        "theorem t : True := by\n  trivial\n\n"
+        "end Toy\n",
+    )
+    (project / "N1.lean").write_text(
+        "namespace One\nabbrev F (T : Type*) := T\n"
+        'notation "X" T => F T\nend One\n',
+        encoding="utf-8",
+    )
+    (project / "N2.lean").write_text(
+        "namespace Two\nabbrev G (T : Type*) := T\n"
+        'notation "X" X => G X\nend Two\n',
+        encoding="utf-8",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    assert "notation" in capsys.readouterr().err
+
+
+def test_generate_rejects_notation_continuation_before_writing(tmp_path, capsys):
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        "namespace Toy\n\n"
+        "abbrev A : Nat :=\n  1\n\n"
+        "abbrev F (T : Type*) := T\n\n"
+        'notation "X" T => F T\n'
+        "  T\n\n"
+        "theorem t : True := by\n  trivial\n\n"
+        "end Toy\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    assert "notation" in capsys.readouterr().err
+
+
+def test_generate_root_qualified_notation_uses_root_target(tmp_path):
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        "abbrev TopA (T : Type*) := T\n\n"
+        "namespace Toy\n\n"
+        "abbrev A : Nat :=\n  1\n\n"
+        "abbrev TopA : Nat :=\n  0\n\n"
+        'notation "R" T => _root_.TopA T\n\n'
+        "theorem t (T : Type*) (x : R T) : True := by\n"
+        "  trivial\n\n"
+        "end Toy\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+    defs = (out / "Game" / "Generated" / "Defs.lean").read_text()
+    assert "abbrev TopA (T : Type*) := T" in defs
+    assert "abbrev TopA : Nat :=\n  0" not in defs
+    level = (out / "Game" / "Levels" / "C" / "L01_t.lean").read_text()
+    assert 'local notation "R" T => _root_.TopA T' in level
+    assert "_root_.Toy.TopA" not in level
+
+
+def test_generate_rejects_notation_target_using_playable_theorem(tmp_path, capsys):
+    project = tmp_path / "proj"
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        "\\chapter{C}\n"
+        "\\begin{lemma}\\label{lem:t}\\lean{Toy.t}\\leanok\n"
+        "  T. \\end{lemma}\n"
+        "\\begin{lemma}\\label{lem:u}\\lean{Toy.u}\\leanok\n"
+        "  U. \\uses{lem:t}\n"
+        "\\end{lemma}\n",
+        encoding="utf-8",
+    )
+    (project / "Basic.lean").write_text(
+        "namespace Toy\n\n"
+        "theorem t : True := by\n  trivial\n\n"
+        "abbrev G : True :=\n  t\n\n"
+        "abbrev F : True :=\n  G\n\n"
+        'notation "X" => F\n\n'
+        "theorem u : X := by\n  trivial\n\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    (project / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "Toy.G" in err
+    assert "Toy.t" in err
+
+
+def test_generate_threads_theorem_only_external_imports(tmp_path):
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        "namespace Toy\n\n"
+        "abbrev A : Nat :=\n  1\n\n"
+        "end Toy\n",
+    )
+    (project / "Ext.lean").write_text(
+        "import Mathlib.Topology.Basic\n", encoding="utf-8"
+    )
+    (project / "Use.lean").write_text(
+        "import Ext\n\n"
+        "namespace Toy\n\n"
+        "theorem t : True := by\n  trivial\n\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+    defs = (out / "Game" / "Generated" / "Defs.lean").read_text()
+    assert "import Mathlib.Topology.Basic" in defs
+    assert "import Ext" not in defs
+    assert "import Use" not in defs
+
+
 def test_deterministic_output(generated, tmp_path):
     again = tmp_path / "game2"
     assert main(["generate", str(PROJECT), "-o", str(again), "--title", "Toy Game"]) == 0

@@ -376,3 +376,176 @@ def test_no_special_case_for_fixture_project_names(tmp_path):
     assert "BanachSteinhausSokalProof.Local" in consumer_decl.imports
     assert "LeanAtlas" in consumer_decl.imports
     assert "Mathlib.Data.Nat.Basic" in consumer_decl.imports
+
+
+def test_plain_global_notation_is_transported(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Toy\n\n"
+        "abbrev NormMap (T : Type*) := T\n\n"
+        'notation "‖" T "·‖" => NormMap T\n\n'
+        "theorem uses_norm (T : Type*) (x : ‖T·‖) : ‖T ·‖ := by\n"
+        "  exact x\n\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    target = decls["Toy.NormMap"]
+    theorem = decls["Toy.uses_norm"]
+    assert target.local_syntax == []
+    assert target.notations == []
+    assert theorem.local_syntax == []
+    assert len(theorem.notations) == 1
+    notation = theorem.notations[0]
+    assert notation.module == "Basic"
+    assert notation.namespace == "Toy"
+    assert notation.pattern == '"‖" T "·‖"'
+    assert notation.target == "Toy.NormMap"
+    assert notation.arguments == ("T",)
+
+
+def test_generated_game_root_is_excluded_by_structure(tmp_path):
+    original = tmp_path / "Original.lean"
+    original.write_text("def original_value : Nat := 1\n", encoding="utf-8")
+    generated = tmp_path / "archive"
+    (generated / "Game" / "Generated").mkdir(parents=True)
+    (generated / "Game.lean").write_text("MakeGame\n", encoding="utf-8")
+    (generated / "Game" / "Metadata.lean").write_text("", encoding="utf-8")
+    (generated / "Game" / "Generated" / "Defs.lean").write_text(
+        "def original_value : String := \"wrong\"\n", encoding="utf-8"
+    )
+    (generated / "lakefile.lean").write_text("", encoding="utf-8")
+    (generated / "lean-toolchain").write_text("", encoding="utf-8")
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+    (ordinary / "Game.lean").write_text(
+        "def ordinary_value : Nat := 2\n", encoding="utf-8"
+    )
+    decls = parse_project(tmp_path)
+    assert decls["original_value"].module == "Original"
+    assert decls["original_value"].signature == ": Nat"
+    assert decls["ordinary_value"].module == "ordinary.Game"
+
+
+def test_project_import_closure_supplies_notation_and_external_imports(tmp_path):
+    (tmp_path / "Base.lean").write_text(
+        "import Mathlib.Topology.Basic\n"
+        "namespace Toy\n"
+        "abbrev NormMap (T : Type*) := T\n"
+        'notation "‖" T "·‖" => NormMap T\n'
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Middle.lean").write_text("import Base\n", encoding="utf-8")
+    (tmp_path / "Use.lean").write_text(
+        "import Middle\n"
+        "namespace Toy\n"
+        "theorem uses_norm (T : Type*) (x : ‖T·‖) : True := by\n"
+        "  trivial\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    theorem = decls["Toy.uses_norm"]
+    assert theorem.notations[0].module == "Base"
+    assert theorem.notations[0].target == "Toy.NormMap"
+    assert theorem.imports == ["Mathlib.Topology.Basic"]
+
+
+def test_supported_and_unsupported_notation_still_reject(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Toy\n"
+        "abbrev NormMap (T : Type*) := T\n"
+        'notation "‖" T "·‖" => NormMap T\n'
+        'local notation "N" => NormMap Nat\n'
+        "theorem uses_norm (T : Type*) (x : ‖T·‖) : True := by\n"
+        "  trivial\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    theorem = parse_project(tmp_path)["Toy.uses_norm"]
+    assert "notation" in theorem.local_syntax
+    assert theorem.notations
+
+
+def test_unsupported_notation_forms_remain_context(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Toy\n"
+        "abbrev NormMap (T : Type*) := T\n"
+        'scoped notation "S" => NormMap Nat\n'
+        'notation3 "M" => NormMap Nat\n'
+        'notation "L" =>\n'
+        "  NormMap Nat\n"
+        'notation "T" => missing\n'
+        'notation "H" => theorem_target\n'
+        "theorem theorem_target : True := by\n  trivial\n"
+        "theorem late : True := by\n  trivial\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    late = parse_project(tmp_path)["Toy.late"]
+    assert late.local_syntax == ["notation", "notation3"]
+
+
+def test_ambiguous_same_pattern_rejects(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Toy\n"
+        "abbrev A (T : Type*) := T\n"
+        "abbrev B (T : Type*) := T\n"
+        'notation "X" T => A T\n'
+        'notation "X" T => B T\n'
+        "theorem late : True := by\n  trivial\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    assert parse_project(tmp_path)["Toy.late"].local_syntax == ["notation"]
+
+
+def test_root_qualified_notation_target_is_not_shadowed(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "abbrev TopA (T : Type*) := T\n"
+        "namespace Toy\n"
+        "abbrev TopA (T : Type*) := T\n"
+        'notation "R" T => _root_.TopA T\n'
+        "theorem uses_root (T : Type*) (x : R T) : True := by\n"
+        "  trivial\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    theorem = parse_project(tmp_path)["Toy.uses_root"]
+    assert theorem.notations[0].target == "TopA"
+
+
+def test_ambiguous_visible_pattern_across_imports_rejects(tmp_path):
+    (tmp_path / "N1.lean").write_text(
+        "namespace One\n"
+        "abbrev F (T : Type*) := T\n"
+        'notation "X" T => F T\n'
+        "end One\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "N2.lean").write_text(
+        "namespace Two\n"
+        "abbrev G (T : Type*) := T\n"
+        'notation  "X"   X   => G X\n'
+        "end Two\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Use.lean").write_text(
+        "import N1\nimport N2\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    assert parse_project(tmp_path)["late"].local_syntax == ["notation"]
+
+
+def test_notation_with_indented_continuation_is_unsupported(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "abbrev F (T : Type*) := T\n"
+        'notation "X" T => F T\n'
+        "  T\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    late = parse_project(tmp_path)["late"]
+    assert late.local_syntax == ["notation"]
+    assert late.notations == []
