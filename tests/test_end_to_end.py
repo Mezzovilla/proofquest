@@ -256,7 +256,10 @@ def test_generate_root_qualified_notation_uses_root_target(tmp_path):
     assert "_root_.Toy.TopA" not in level
 
 
-def test_generate_rejects_notation_target_using_playable_theorem(tmp_path, capsys):
+def test_generate_stages_notation_target_using_playable_theorem(tmp_path):
+    """A notation target chain that mentions a level theorem can no more
+    live in the preamble than the theorem itself: the copied abbreviations
+    are staged into a ``DefsAfter`` module emitted after that level."""
     project = tmp_path / "proj"
     (project / "blueprint" / "src").mkdir(parents=True)
     (project / "blueprint" / "src" / "content.tex").write_text(
@@ -283,11 +286,20 @@ def test_generate_rejects_notation_target_using_playable_theorem(tmp_path, capsy
     )
     out = tmp_path / "game"
 
-    assert main(["generate", str(project), "-o", str(out)]) == 1
-    assert not out.exists() or not any(out.rglob("*"))
-    err = capsys.readouterr().err
-    assert "Toy.G" in err
-    assert "Toy.t" in err
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+
+    defs = (out / "Game/Generated/Defs.lean").read_text()
+    assert "abbrev G" not in defs and "abbrev F" not in defs
+    stage = (out / "Game/Generated/DefsAfter001.lean").read_text()
+    assert "import Game.Levels.C.L01_t" in stage
+    assert "abbrev G : True :=\n  t" in stage
+    assert "abbrev F : True :=\n  G" in stage
+    level = (out / "Game/Levels/C/L02_u.lean").read_text()
+    assert "import Game.Generated.DefsAfter001" in level
+    assert 'local notation "X" => _root_.Toy.F' in level
+    assert "NewDefinition Toy.G Toy.F" in level or (
+        "NewDefinition Toy.F Toy.G" in level
+    )
 
 
 def test_generate_threads_theorem_only_external_imports(tmp_path):
@@ -619,3 +631,89 @@ def test_generate_rejects_command_local_variable_target(tmp_path, capsys):
     assert "Toy.A" in err
     assert "variable" in err
     assert "Basic.lean:3" in err
+
+
+def test_generate_rejects_mixed_def_level_cycle_before_writing(tmp_path, capsys):
+    """A definition depending on a target theorem while the target's
+    signature needs that definition is a real mixed cycle: `generate`
+    fails with the declaration, file:line origins and the full chain,
+    and writes nothing."""
+    project = tmp_path / "proj"
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        "\\chapter{C}\n"
+        "\\begin{lemma}\\label{lem:t2}\\lean{Toy.t2}\\leanok\n"
+        "  T2.\n"
+        "\\end{lemma}\n"
+        "\\begin{definition}\\label{def:B}\\lean{Toy.B}\n"
+        "  B.\n"
+        "\\end{definition}\n",
+        encoding="utf-8",
+    )
+    (project / "Basic.lean").write_text(
+        "namespace Toy\n\n"
+        "def B : Nat :=\n  if t2 then 1 else 2\n\n"
+        "theorem t2 : B = B := by\n  rfl\n\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    (project / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "cycle" in err
+    assert "Toy.B" in err and "Toy.t2" in err
+    assert "Basic.lean:" in err
+    assert "->" in err
+
+
+def test_generate_rejects_impossible_world_layout_before_writing(
+    tmp_path, capsys
+):
+    """Chapter A target -> chapter B target -> chapter A target (through a
+    dependent definition) cannot be laid out in grouped worlds: `generate`
+    fails with the world cycle and witness chain, and writes nothing."""
+    project = tmp_path / "proj"
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        "\\chapter{A}\n"
+        "\\begin{lemma}\\label{lem:a1}\\lean{Toy.a1}\\leanok\n"
+        "  A1.\n"
+        "\\end{lemma}\n"
+        "\\chapter{B}\n"
+        "\\begin{lemma}\\label{lem:b1}\\lean{Toy.b1}\\leanok\n"
+        "  B1.\n"
+        "\\end{lemma}\n"
+        "\\begin{definition}\\label{def:dv}\\lean{Toy.dv}\n"
+        "  D.\n"
+        "\\end{definition}\n"
+        "\\chapter{A}\n"
+        "\\begin{lemma}\\label{lem:a2}\\lean{Toy.a2}\\leanok\n"
+        "  A2. \\uses{def:dv}\n"
+        "\\end{lemma}\n",
+        encoding="utf-8",
+    )
+    (project / "Basic.lean").write_text(
+        "namespace Toy\n\n"
+        "theorem a1 : True := by\n  trivial\n\n"
+        "theorem b1 : True := by\n  exact a1\n\n"
+        "def dv : True :=\n  b1\n\n"
+        "theorem a2 : dv = dv := by\n  rfl\n\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    (project / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert not out.exists() or not any(out.rglob("*"))
+    err = capsys.readouterr().err
+    assert "world" in err
+    assert "Basic.lean:" in err
+    assert "Toy.dv" in err or "Toy.b1" in err

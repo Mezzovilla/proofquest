@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 from pathlib import Path
 
 from .dep_graph import topological_order
-from .game_model import Blueprint, BlueprintNode, Game, LeanDecl, Level, World
+from .game_model import (
+    Blueprint,
+    BlueprintNode,
+    DefsStage,
+    Game,
+    LeanDecl,
+    Level,
+    World,
+)
 from .latex_to_md import latex_to_markdown, lean_interp_string, lean_string
 
 _TACTIC_DOCS = {
@@ -559,21 +568,24 @@ def _copy_order(
     label: str,
     project_scopes: set[str],
     instance_roots: list[LeanDecl] | None = None,
+    allow_level_dependencies: bool = False,
+    target_file: str = "Game/Generated/Defs.lean",
 ) -> list[LeanDecl]:
     """``roots`` plus their transitive project-local dependencies, deps first.
 
     Deterministic: dependencies are visited in the order they are referenced
     in each declaration's source text. Names in ``blueprint_theorems`` are
     blueprint *theorem* declarations: they become game levels via `Statement`
-    and can never be copied into ``Defs.lean`` (the duplicate name would
-    clash with the level's own declaration), so depending on one — directly
-    or transitively — is a :class:`GenerationError` rather than a silently
-    dangling reference. Likewise, a declaration from a source context that
-    defines project-local notation/syntax cannot be reproduced verbatim in
-    the self-contained generated file, so it is rejected by name rather than
-    emitted broken; and a dependency cycle (impossible in valid Lean, but
-    reachable through the text-level dependency approximation) is reported
-    instead of being emitted in an arbitrary order.
+    and can never be copied into a definitions module (the duplicate name
+    would clash with the level's own declaration). When
+    ``allow_level_dependencies`` is set, such a dependency is skipped instead
+    of rejected: the caller is responsible for staging the copied declaration
+    after the level that provides it. A declaration from a source context
+    that defines project-local notation/syntax cannot be reproduced verbatim
+    in a self-contained generated file, so it is rejected by name rather
+    than emitted broken; and a dependency cycle (impossible in valid Lean,
+    but reachable through the text-level dependency approximation) is
+    reported instead of being emitted in an arbitrary order.
     """
     ordered: list[LeanDecl] = []
     seen: set[str] = set()
@@ -583,12 +595,13 @@ def _copy_order(
 
     def visit(dep: LeanDecl) -> None:
         if dep.full_name in blueprint_theorems:
+            if allow_level_dependencies:
+                return
             raise GenerationError(
                 f"{label}: copied declaration {visiting[-1] if visiting else dep.full_name} "
                 f"depends on blueprint theorem {dep.full_name}{_decl_origin(dep)}, "
                 "which becomes a game level and cannot be copied into "
-                "Defs.lean; restate that dependency in the source as a "
-                "project definition"
+                "a generated definitions module"
             )
         visit_or_context(dep)
 
@@ -603,9 +616,7 @@ def _copy_order(
             return
         if decl.local_syntax:
             raise GenerationError(
-                _unsupported_context_message(
-                    label, decl, visiting, "Game/Generated/Defs.lean"
-                )
+                _unsupported_context_message(label, decl, visiting, target_file)
             )
         bad_opens = _project_open_targets(decl, project_scopes)
         if bad_opens:
@@ -613,7 +624,7 @@ def _copy_order(
                 f"{label}: copied declaration {decl.full_name}"
                 f"{_decl_origin(decl)} relies on project-local `open` "
                 f"({', '.join(bad_opens)}) whose namespace cannot be "
-                "reproduced self-contained in Game/Generated/Defs.lean; "
+                f"reproduced self-contained in {target_file}; "
                 "qualify the names explicitly or move the declaration to a "
                 "module that does not rely on project-local opens"
             )
@@ -635,10 +646,12 @@ def _copy_order(
 
     for root in roots:
         if root.full_name in blueprint_theorems:
+            if allow_level_dependencies:
+                continue
             raise GenerationError(
                 f"{label}: blueprint theorem {root.full_name}"
                 f"{_decl_origin(root)} becomes a game level and cannot be "
-                "copied into Defs.lean"
+                "copied into a generated definitions module"
             )
         visit_or_context(root)
     for inst in instance_roots or ():
@@ -739,6 +752,339 @@ def _ref_titles(blueprint: Blueprint) -> dict[str, str]:
     return {n.label: (n.title or n.label) for n in blueprint.nodes}
 
 
+def _find_mixed_cycle(
+    start: str, depends: dict[str, list[str]]
+) -> list[str] | None:
+    """A ``start -> ... -> start`` chain in the mixed dependency graph.
+
+    ``depends`` maps a declaration's full name to the full names it refers
+    to in the Lean source (both copied auxiliaries and level theorems).
+    Returns the cycle with ``start``'s first repeated node at both ends, or
+    ``None`` when ``start`` is not on a cycle.
+    """
+    color: dict[str, int] = {}
+    stack: list[str] = []
+
+    def dfs(node: str) -> list[str] | None:
+        color[node] = 1
+        stack.append(node)
+        for dep in depends.get(node, ()):
+            if dep not in depends:
+                continue
+            state = color.get(dep, 0)
+            if state == 1:
+                return stack[stack.index(dep):] + [dep]
+            if state == 0:
+                found = dfs(dep)
+                if found is not None:
+                    return found
+        stack.pop()
+        color[node] = 2
+        return None
+
+    return dfs(start)
+
+
+def _level_order(
+    blueprint: Blueprint,
+    all_nodes: list[BlueprintNode],
+    theorem_nodes: list[BlueprintNode],
+    decl_by_label: dict[str, LeanDecl],
+    node_by_name: dict[str, BlueprintNode],
+    thm_refs: dict[str, list[LeanDecl]],
+    required_aux: dict[str, list[LeanDecl]],
+    aux_edges: dict[str, list[LeanDecl]],
+    aux_prereqs,
+    decls: dict[str, LeanDecl],
+) -> tuple[list[BlueprintNode], list[tuple[str, str]]]:
+    """Global emission order of the theorem levels plus world dependencies.
+
+    Ordering constraints are derived from the *projected* prerequisite graph
+    over blueprint nodes (theorems and definitions): blueprint ``\\uses``
+    edges on any node, references to other blueprint declarations found in a
+    target's own source (signature *and* sample proof; a target's proof never
+    constrains itself), and level-theorem prerequisites of every required
+    auxiliary — so ``U -> T`` holds whenever ``T`` needs a definition that
+    transitively needs level ``U``, whether the requirement enters through
+    the blueprint or through source. A theorem ancestor of a target in a
+    different world induces an edge in the world DAG; when that DAG is
+    cyclic the grouped layout cannot satisfy the ordering and generation
+    fails with the witnessing dependency chain. Otherwise worlds are
+    topo-sorted by blueprint rank, targets are topo-sorted inside each
+    world, and the flattened sequence — worlds emitted contiguously — is
+    returned, so emission positions are always consistent with
+    ``Game.worlds``.
+    """
+    by_label = blueprint.by_label()
+    edges: dict[str, set[str]] = {}
+
+    def add_edge(source: str, target: str) -> None:
+        edges.setdefault(source, set()).add(target)
+
+    for node in all_nodes:
+        for use in node.uses:
+            if use in by_label:
+                add_edge(use, node.label)
+        if node.is_theorem:
+            for ref in thm_refs[node.label]:
+                ref_node = node_by_name.get(ref.full_name)
+                if ref_node is not None and ref_node.label != node.label:
+                    add_edge(ref_node.label, node.label)
+            for aux in required_aux[node.label]:
+                aux_node = node_by_name.get(aux.full_name)
+                if aux_node is not None and aux_node.label != node.label:
+                    add_edge(aux_node.label, node.label)
+                for name in aux_prereqs(aux.full_name):
+                    used = node_by_name.get(name)
+                    if used is not None:
+                        add_edge(used.label, node.label)
+        else:
+            for name in node.lean_names:
+                named = decls.get(name)
+                if named is None:
+                    continue
+                for dep in aux_edges.get(named.full_name, ()):
+                    dep_node = node_by_name.get(dep.full_name)
+                    if dep_node is not None and dep_node.label != node.label:
+                        add_edge(dep_node.label, node.label)
+                for theorem_name in aux_prereqs(named.full_name):
+                    used = node_by_name.get(theorem_name)
+                    if used is not None and used.label != node.label:
+                        add_edge(used.label, node.label)
+
+    predecessors: dict[str, set[str]] = {}
+    for source, targets in edges.items():
+        for target in targets:
+            predecessors.setdefault(target, set()).add(source)
+
+    def label_cycle() -> list[str] | None:
+        color: dict[str, int] = {}
+        stack: list[str] = []
+
+        def dfs(label: str) -> list[str] | None:
+            color[label] = 1
+            stack.append(label)
+            for dep in sorted(predecessors.get(label, ())):
+                state = color.get(dep, 0)
+                if state == 1:
+                    return stack[stack.index(dep):] + [dep]
+                if state == 0:
+                    found = dfs(dep)
+                    if found is not None:
+                        return found
+            stack.pop()
+            color[label] = 2
+            return None
+
+        for node in all_nodes:
+            if color.get(node.label, 0) == 0:
+                found = dfs(node.label)
+                if found is not None:
+                    return found
+        return None
+
+    cycle = label_cycle()
+    if cycle is not None:
+        depends: dict[str, list[str]] = {
+            name: [dep.full_name for dep in deps]
+            for name, deps in aux_edges.items()
+        }
+        for node in all_nodes:
+            decl = decl_by_label.get(node.label)
+            if decl is None:
+                continue
+            names = [
+                decl_by_label[use].full_name
+                for use in node.uses
+                if use in decl_by_label
+            ]
+            if node.is_theorem:
+                names += [aux.full_name for aux in required_aux[node.label]]
+                names += [
+                    ref.full_name
+                    for ref in thm_refs[node.label]
+                    if ref.full_name in node_by_name
+                ]
+            depends[decl.full_name] = depends.get(decl.full_name, []) + [
+                name for name in names
+                if name not in depends.get(decl.full_name, [])
+            ]
+        start = decl_by_label[cycle[0]].full_name
+
+        def origin(name: str) -> str:
+            found = decls.get(name)
+            return _decl_origin(found) if found is not None else ""
+
+        mixed = _find_mixed_cycle(start, depends)
+        if mixed is not None:
+            chain = " -> ".join(f"{name}{origin(name)}" for name in mixed)
+            raise GenerationError(
+                f"{cycle[0]}: dependency cycle between copied definitions "
+                f"and level theorems prevents a valid emission order: "
+                f"{chain}; each step is a source-level dependency in the "
+                "named declaration, so no emission order can place every "
+                "prerequisite before its dependents"
+            )
+        chain = " -> ".join(
+            f"{label} ({decl_by_label[label].full_name}"
+            f"{origin(decl_by_label[label].full_name)})"
+            for label in cycle
+        )
+        raise GenerationError(
+            f"{cycle[0]}: dependency cycle prevents a valid emission order: "
+            f"{chain}; each step is a blueprint or source-level dependency, "
+            "so no emission order can place every prerequisite before its "
+            "dependents"
+        )
+
+    def path(source: str, target: str) -> list[str]:
+        previous = {target: None}
+        queue = [target]
+        while queue:
+            current = queue.pop(0)
+            if current == source:
+                break
+            for pred in sorted(predecessors.get(current, ())):
+                if pred not in previous:
+                    previous[pred] = current
+                    queue.append(pred)
+        result = [source]
+        while result[-1] != target:
+            result.append(previous[result[-1]])
+        return result
+
+    theorem_labels = {node.label for node in theorem_nodes}
+    projected: dict[tuple[str, str], list[str]] = {}
+    for node in theorem_nodes:
+        seen: set[str] = set()
+        stack = [node.label]
+        while stack:
+            current = stack.pop()
+            for pred in predecessors.get(current, ()):
+                if pred not in seen:
+                    seen.add(pred)
+                    stack.append(pred)
+        for ancestor in sorted(seen, key=lambda label: (by_label[label].order, label)):
+            if ancestor in theorem_labels and ancestor != node.label:
+                projected[(ancestor, node.label)] = path(ancestor, node.label)
+
+    world_of = {node.label: _camel(node.chapter) for node in theorem_nodes}
+    world_edges: dict[tuple[str, str], list[str]] = {}
+    for (source, target), witness in projected.items():
+        pair = (world_of[source], world_of[target])
+        if pair[0] != pair[1] and pair not in world_edges:
+            world_edges[pair] = witness
+
+    world_rank: dict[str, int] = {}
+    for node in theorem_nodes:
+        wid = world_of[node.label]
+        world_rank[wid] = min(world_rank.get(wid, node.order), node.order)
+    world_next: dict[str, set[str]] = {}
+    world_indegree = {wid: 0 for wid in world_rank}
+    for source, target in world_edges:
+        if target not in world_next.setdefault(source, set()):
+            world_next[source].add(target)
+            world_indegree[target] = world_indegree.get(target, 0) + 1
+    ready_worlds = sorted(
+        (wid for wid, deg in world_indegree.items() if deg == 0),
+        key=lambda wid: world_rank[wid],
+    )
+    world_seq: list[str] = []
+    while ready_worlds:
+        wid = ready_worlds.pop(0)
+        world_seq.append(wid)
+        changed = False
+        for nxt in world_next.get(wid, ()):
+            world_indegree[nxt] -= 1
+            if world_indegree[nxt] == 0:
+                ready_worlds.append(nxt)
+                changed = True
+        if changed:
+            ready_worlds.sort(key=lambda item: world_rank[item])
+    if len(world_seq) != len(world_rank):
+        remaining = sorted(
+            (wid for wid in world_rank if wid not in world_seq),
+            key=lambda wid: world_rank[wid],
+        )
+        color: dict[str, int] = {}
+        wstack: list[str] = []
+
+        def world_cycle_dfs(wid: str) -> list[str] | None:
+            color[wid] = 1
+            wstack.append(wid)
+            for nxt in sorted(world_next.get(wid, ())):
+                state = color.get(nxt, 0)
+                if state == 1:
+                    return wstack[wstack.index(nxt):] + [nxt]
+                if state == 0:
+                    found = world_cycle_dfs(nxt)
+                    if found is not None:
+                        return found
+            wstack.pop()
+            color[wid] = 2
+            return None
+
+        found_cycle = None
+        for wid in remaining:
+            if color.get(wid, 0) == 0:
+                found_cycle = world_cycle_dfs(wid)
+                if found_cycle is not None:
+                    break
+        found_cycle = found_cycle or remaining + [remaining[0]]
+
+        def describe(label: str) -> str:
+            decl = decl_by_label.get(label)
+            name = decl.full_name if decl is not None else label
+            return f"{name}{_decl_origin(decl) if decl is not None else ''} [{label}]"
+
+        hops = []
+        for source_wid, target_wid in itertools.pairwise(found_cycle):
+            witness = world_edges.get((source_wid, target_wid))
+            if witness:
+                hops.append(" -> ".join(describe(label) for label in witness))
+        raise GenerationError(
+            "unsupported grouped world layout: worlds form a dependency "
+            f"cycle {' -> '.join(found_cycle)}"
+            + (f"; required by {'; '.join(hops)}" if hops else "")
+            + "; each world is emitted contiguously, so no global level "
+            "order can place every prerequisite before its dependents"
+        )
+
+    order_of = {node.label: node.order for node in theorem_nodes}
+    result: list[BlueprintNode] = []
+    node_by_label = {node.label: node for node in theorem_nodes}
+    for wid in world_seq:
+        members = [node for node in theorem_nodes if world_of[node.label] == wid]
+        indegree = {node.label: 0 for node in members}
+        dependents: dict[str, list[str]] = {node.label: [] for node in members}
+        for (source, target) in projected:
+            if source in indegree and target in indegree:
+                indegree[target] += 1
+                dependents[source].append(target)
+        ready = sorted(
+            (label for label, deg in indegree.items() if deg == 0),
+            key=lambda label: order_of[label],
+        )
+        while ready:
+            label = ready.pop(0)
+            result.append(node_by_label[label])
+            changed = False
+            for dep in dependents[label]:
+                indegree[dep] -= 1
+                if indegree[dep] == 0:
+                    ready.append(dep)
+                    changed = True
+            if changed:
+                ready.sort(key=lambda lbl: order_of[lbl])
+
+    world_position = {wid: index for index, wid in enumerate(world_seq)}
+    dependencies = sorted(
+        world_edges,
+        key=lambda pair: (world_position[pair[0]], world_position[pair[1]]),
+    )
+    return result, dependencies
+
+
 def build_game(
     blueprint: Blueprint,
     decls: dict[str, LeanDecl],
@@ -783,6 +1129,7 @@ def build_game(
             owner = node if dep.full_name in named_names else def_node_by_name.get(dep.full_name)
             definitions.append((dep, owner))
 
+    decl_by_label: dict[str, LeanDecl] = {}
     for node in order:
         if node.is_theorem:
             continue
@@ -798,20 +1145,26 @@ def build_game(
                 )
             )
         named = [decls[name] for name in node.lean_names]
+        decl_by_label[node.label] = named[0]
         named_names = {d.full_name for d in named}
-        copied = _copy_order(named, decls, theorem_names, node.label, project_scopes)
+        copied = _copy_order(
+            named,
+            decls,
+            theorem_names,
+            node.label,
+            project_scopes,
+            allow_level_dependencies=True,
+        )
         append_definitions(copied, node, named_names)
         def_closure_by_label[node.label] = copied
 
-    worlds: dict[str, World] = {}
-    world_order: list[str] = []
-    introduced_defs: set[str] = set()
-    introduced_tactics: list[str] = []
-    introduced_theorems: list[str] = []
-
-    for node in order:
-        if not node.is_theorem:
-            continue
+    theorem_nodes = [node for node in order if node.is_theorem]
+    theorem_decl: dict[str, LeanDecl] = {}
+    theorem_node_by_name: dict[str, BlueprintNode] = {}
+    thm_refs: dict[str, list[LeanDecl]] = {}
+    required_aux: dict[str, list[LeanDecl]] = {}
+    theorem_copied: dict[str, list[LeanDecl]] = {}
+    for node in theorem_nodes:
         decl = node_decl(node)
         if decl is None:
             raise GenerationError(
@@ -834,20 +1187,119 @@ def build_game(
                 "move the declaration to a module that does not rely on "
                 "project-local opens"
             )
+        theorem_decl[node.label] = decl
+        decl_by_label[node.label] = decl
+        for name in (*node.lean_names, decl.full_name):
+            theorem_names.add(name)
+            theorem_node_by_name[name] = node
+        source_refs = _source_refs(decl, decls)
+        thm_refs[node.label] = source_refs
+        needed = [r for r in source_refs if r.full_name not in theorem_names]
+        seen_needed = {r.full_name for r in needed}
+        for inst in decl.instances:
+            if inst.full_name not in seen_needed:
+                needed.append(inst)
+                seen_needed.add(inst.full_name)
+        required_aux[node.label] = needed
         notation_roots = [
             decls[notation.target]
             for notation in decl.notations
             if notation.target in decls
         ]
-        notation_copied = _copy_order(
-            notation_roots,
+        copied = _copy_order(
+            notation_roots + needed,
             decls,
             theorem_names,
             node.label,
             project_scopes,
             instance_roots=decl.instances,
+            allow_level_dependencies=True,
+            target_file="a staged Game/Generated/DefsAfterNNN.lean module",
         )
-        append_definitions(notation_copied, node, set())
+        theorem_copied[node.label] = copied
+        append_definitions(copied, node, set())
+
+    aux_edges: dict[str, list[LeanDecl]] = {}
+    for decl, _ in definitions:
+        deps = _source_refs(decl, decls)
+        seen_dep = {dep.full_name for dep in deps}
+        for inst in decl.instances:
+            if inst.full_name not in seen_dep:
+                deps.append(inst)
+                seen_dep.add(inst.full_name)
+        aux_edges[decl.full_name] = deps
+
+    prereq_cache: dict[str, frozenset[str]] = {}
+
+    def aux_prereqs(name: str, stack: tuple[str, ...] = ()) -> frozenset[str]:
+        """Blueprint-theorem full names an auxiliary transitively needs."""
+        if name in prereq_cache:
+            return prereq_cache[name]
+        acc: set[str] = set()
+        for dep in aux_edges.get(name, ()):
+            if dep.full_name in theorem_names:
+                acc.add(dep.full_name)
+            elif dep.full_name in aux_edges and dep.full_name not in stack:
+                acc |= aux_prereqs(dep.full_name, (*stack, name))
+        prereq_cache[name] = frozenset(acc)
+        return prereq_cache[name]
+
+    node_by_name: dict[str, BlueprintNode] = {}
+    for node in order:
+        for name in node.lean_names:
+            if name in decls and name not in node_by_name:
+                node_by_name[name] = node
+    for node in theorem_nodes:
+        node_by_name.setdefault(theorem_decl[node.label].full_name, node)
+
+    level_order, world_edges = _level_order(
+        blueprint,
+        order,
+        theorem_nodes,
+        decl_by_label,
+        node_by_name,
+        thm_refs,
+        required_aux,
+        aux_edges,
+        aux_prereqs,
+        decls,
+    )
+    position = {node.label: i + 1 for i, node in enumerate(level_order)}
+
+    stage_of: dict[str, int] = {}
+    for decl, _ in definitions:
+        stage_of[decl.full_name] = max(
+            (
+                position[theorem_node_by_name[name].label]
+                for name in aux_prereqs(decl.full_name)
+                if name in theorem_node_by_name
+            ),
+            default=0,
+        )
+    for node in level_order:
+        for aux in required_aux[node.label]:
+            if stage_of[aux.full_name] >= position[node.label]:
+                needed = sorted(aux_prereqs(aux.full_name))
+                raise GenerationError(
+                    f"{node.label}: copied declaration {aux.full_name}"
+                    f"{_decl_origin(aux)} is needed by this level but "
+                    "depends on level theorem(s) "
+                    f"{', '.join(needed)} emitted at or after it; no "
+                    "emission order can place the definition between them "
+                    "without revisiting an already emitted level or world"
+                )
+
+    worlds: dict[str, World] = {}
+    world_order: list[str] = []
+    introduced_defs: set[str] = set()
+    introduced_tactics: list[str] = []
+    introduced_theorems: list[str] = []
+    level_at: dict[int, Level] = {}
+    desired_intro: dict[str, int] = {}
+
+    for node in level_order:
+        decl = theorem_decl[node.label]
+        notation_copied = theorem_copied[node.label]
         world_id = _camel(node.chapter)
         if world_id in worlds and worlds[world_id].title != node.chapter:
             raise GenerationError(
@@ -864,19 +1316,28 @@ def build_game(
             world_order.append(world_id)
         world = worlds[world_id]
 
+        pos = position[node.label]
+
+        def introduce(
+            dep: LeanDecl, out: list[LeanDecl], at: int = pos
+        ) -> None:
+            if not dep.is_definition or dep.full_name in introduced_defs:
+                return
+            if stage_of[dep.full_name] < at:
+                introduced_defs.add(dep.full_name)
+                out.append(dep)
+            else:
+                desired_intro.setdefault(dep.full_name, at)
+
         new_defs: list[LeanDecl] = []
         for dep in notation_copied:
-            if dep.is_definition and dep.full_name not in introduced_defs:
-                introduced_defs.add(dep.full_name)
-                new_defs.append(dep)
+            introduce(dep, new_defs)
         for use in node.uses:
             used = by_label.get(use)
             if used is None or used.is_theorem:
                 continue
             for dep in def_closure_by_label[use]:
-                if dep.is_definition and dep.full_name not in introduced_defs:
-                    introduced_defs.add(dep.full_name)
-                    new_defs.append(dep)
+                introduce(dep, new_defs)
 
         new_tactics: list[str] = []
         new_theorems: list[str] = []
@@ -900,21 +1361,69 @@ def build_game(
                     new_theorems.append(theorem)
 
         index = len(world.levels) + 1
-        world.levels.append(
-            Level(
-                index=index,
-                world_id=world_id,
-                file_stem=f"L{index:02d}_{decl.name.replace('.', '_')}",
-                title=node.title or decl.name,
-                intro_md=latex_to_markdown(node.statement_tex, refs),
-                hint_md=latex_to_markdown(node.proof_tex, refs) if node.proof_tex else None,
-                decl=decl,
-                node=node,
-                new_definitions=new_defs,
-                new_tactics=new_tactics,
-                new_theorems=new_theorems,
+        level = Level(
+            index=index,
+            world_id=world_id,
+            file_stem=f"L{index:02d}_{decl.name.replace('.', '_')}",
+            title=node.title or decl.name,
+            intro_md=latex_to_markdown(node.statement_tex, refs),
+            hint_md=latex_to_markdown(node.proof_tex, refs) if node.proof_tex else None,
+            decl=decl,
+            node=node,
+            new_definitions=new_defs,
+            new_tactics=new_tactics,
+            new_theorems=new_theorems,
+        )
+        world.levels.append(level)
+        level_at[pos] = level
+
+    n_levels = len(level_order)
+    for decl, _ in definitions:
+        if not decl.is_definition or decl.full_name in introduced_defs:
+            continue
+        target_pos = max(desired_intro.get(decl.full_name, 0), stage_of[decl.full_name] + 1)
+        if 1 <= target_pos <= n_levels:
+            level_at[target_pos].new_definitions.append(decl)
+            introduced_defs.add(decl.full_name)
+
+    staged: dict[int, list[tuple[LeanDecl, BlueprintNode | None]]] = {}
+    for pair in definitions:
+        staged.setdefault(stage_of[pair[0].full_name], []).append(pair)
+    stages = [DefsStage(index=0, level=None, definitions=staged.get(0, []))]
+    for index_ in sorted(k for k in staged if k > 0):
+        earlier = sorted(
+            {
+                stage_of[dep.full_name]
+                for decl, _ in staged[index_]
+                for dep in aux_edges.get(decl.full_name, ())
+                if 0 < stage_of.get(dep.full_name, 0) < index_
+            }
+        )
+        stages.append(
+            DefsStage(
+                index=index_,
+                level=level_at.get(index_),
+                definitions=staged[index_],
+                imports=earlier,
             )
         )
+
+    intro_world: dict[str, str] = {}
+    for pos, level in level_at.items():
+        for decl in level.new_definitions:
+            intro_world.setdefault(decl.full_name, level.world_id)
+    dependency_pairs = set(world_edges)
+    for node in level_order:
+        consumer_world = level_at[position[node.label]].world_id
+        used_defs = {aux.full_name for aux in required_aux[node.label]}
+        for use in node.uses:
+            used_defs.update(
+                dep.full_name for dep in def_closure_by_label.get(use, ())
+            )
+        for name in used_defs:
+            source_world = intro_world.get(name)
+            if source_world is not None and source_world != consumer_world:
+                dependency_pairs.add((source_world, consumer_world))
 
     return Game(
         title=title,
@@ -925,6 +1434,8 @@ def build_game(
         tactics=introduced_tactics,
         theorems=introduced_theorems,
         toolchain=toolchain,
+        stages=stages,
+        world_dependencies=sorted(dependency_pairs),
     )
 
 
@@ -1060,13 +1571,20 @@ def _statement_proof(level: Level) -> str:
     return "by\n" + "\n".join(f"  {line}" for line in lines)
 
 
-def _render_level(game: Game, level: Level, previous: Level | None) -> str:
+def _render_level(
+    game: Game,
+    level: Level,
+    previous: Level | None,
+    staged_module: str | None = None,
+) -> str:
     decl = level.decl
     # Levels get Mathlib transitively via Game.Metadata -> Game.Generated.Defs,
     # so we do NOT re-import Mathlib modules here (dedup saves load time).
     imports = ["import Game.Metadata"]
     if previous is not None:
         imports.append(f"import Game.Levels.{previous.world_id}.{previous.file_stem}")
+    if staged_module is not None:
+        imports.append(f"import {staged_module}")
 
     parts = [
         "\n".join(imports),
@@ -1126,8 +1644,15 @@ def _render_world(world: World) -> str:
     )
 
 
-def _render_game_root(game: Game) -> str:
-    imports = "\n".join(f"import Game.Levels.{world.world_id}" for world in game.worlds)
+def _render_game_root(game: Game, extra_imports: list[str] | None = None) -> str:
+    lines = [f"import Game.Levels.{world.world_id}" for world in game.worlds]
+    lines.extend(extra_imports or ())
+    imports = "\n".join(lines)
+    dependencies = "\n".join(
+        f"Dependency {source} → {target}"
+        for source, target in game.world_dependencies
+    )
+    dependency_block = f"{dependencies}\n\n" if dependencies else ""
     return f'''{imports}
 
 Title "{lean_string(game.title)}"
@@ -1147,19 +1672,29 @@ CaptionShort "{lean_string(game.title)}"
 CaptionLong "A game generated from a leanblueprint dependency graph, where you
 prove the theorems of the original project guided by its LaTeX write-up."
 
-/-! Build the game. Shows warnings if it found a problem with your game. -/
+{dependency_block}/-! Build the game. Shows warnings if it found a problem with your game. -/
 MakeGame
 '''
 
 
-def _render_defs(game: Game) -> str:
-    # Collect the union of external imports needed by all definitions.
+def _render_defs_stage(game: Game, stage: DefsStage) -> str:
+    """Render one definitions module: preamble (index 0) or staged.
+
+    The preamble additionally carries the union of the level theorems'
+    external imports, because ``Game.Metadata`` is what gives every level
+    file its Mathlib context. A staged module imports the level file at
+    its global position instead: that pulls in ``Game.Metadata`` (and with
+    it the preamble and every earlier stage), and guarantees the level
+    theorems the staged declarations depend on are already in scope.
+    """
     all_imports: list[str] = []
     seen: set[str] = set()
-    import_decls = [decl for decl, _ in game.definitions]
-    import_decls.extend(
-        level.decl for world in game.worlds for level in world.levels
-    )
+    # Collect the union of external imports needed by all definitions.
+    import_decls = [decl for decl, _ in stage.definitions]
+    if stage.index == 0:
+        import_decls.extend(
+            level.decl for world in game.worlds for level in world.levels
+        )
     for decl in list(import_decls):
         import_decls.extend(decl.instances)
     for decl in import_decls:
@@ -1167,19 +1702,34 @@ def _render_defs(game: Game) -> str:
             if imp not in seen:
                 seen.add(imp)
                 all_imports.append(imp)
-    import_block = "\n".join(f"import {imp}" for imp in all_imports)
-    parts = [f"{import_block}\nimport GameServer.Commands"] if all_imports else ["import GameServer.Commands"]
+    import_lines = [f"import {imp}" for imp in all_imports]
+    if stage.index > 0:
+        if stage.level is None:
+            raise GenerationError(
+                "internal error: staged definitions have no prerequisite level"
+            )
+        import_lines.append(
+            f"import Game.Levels.{stage.level.world_id}.{stage.level.file_stem}"
+        )
+        module_of = {item.index: item.module for item in game.stages}
+        import_lines.extend(
+            f"import {module_of[index]}"
+            for index in stage.imports
+            if index in module_of
+        )
+    import_lines.append("import GameServer.Commands")
+    parts = ["\n".join(import_lines)]
     # Collect the union of `open` statements needed by all definitions.
     all_opens: list[str] = []
     seen_opens: set[str] = set()
-    for decl, _ in game.definitions:
+    for decl, _ in stage.definitions:
         for op in decl.opens:
             if op not in seen_opens:
                 seen_opens.add(op)
                 all_opens.append(op)
     if all_opens:
         parts.append("section\n" + "\n".join(all_opens) + "\nend")
-    for decl, node in game.definitions:
+    for decl, node in stage.definitions:
         doc_md = (
             latex_to_markdown(node.statement_tex) if node else f"Definition `{decl.full_name}`."
         )
@@ -1208,6 +1758,14 @@ def _render_defs(game: Game) -> str:
                 )
         parts.append(block)
     return "\n\n".join(parts) + "\n"
+
+
+def _render_defs(game: Game) -> str:
+    """Preamble module only: everything without a level prerequisite."""
+    preamble = (
+        game.stages[0].definitions if game.stages else game.definitions
+    )
+    return _render_defs_stage(game, DefsStage(index=0, definitions=preamble))
 
 
 def _render_tactic_docs(game: Game) -> str:
@@ -1312,19 +1870,42 @@ def write_game(game: Game, output_dir: Path) -> list[Path]:
         path.write_text(content, encoding="utf-8")
         written.append(path)
 
-    emit("Game.lean", _render_game_root(game))
+    stages = game.stages or [DefsStage(index=0, definitions=game.definitions)]
+    stage_by_index = {stage.index: stage for stage in stages}
+    n_levels = sum(len(world.levels) for world in game.worlds)
+    trailing = (
+        f"import {stages[-1].module}"
+        if n_levels > 0 and stages[-1].index == n_levels and stages[-1].definitions
+        else None
+    )
+
+    emit("Game.lean", _render_game_root(game, [trailing] if trailing else None))
     emit("Game/Metadata.lean", _METADATA)
-    emit("Game/Generated/Defs.lean", _render_defs(game))
+    for stage in stages:
+        emit(
+            f"Game/Generated/{stage.module_stem}.lean",
+            _render_defs_stage(game, stage),
+        )
     emit("Game/Generated/TacticDocs.lean", _render_tactic_docs(game))
     emit("Game/Generated/TheoremDocs.lean", _render_theorem_docs(game))
 
     previous: Level | None = None
+    position = 0
     for world in game.worlds:
         emit(f"Game/Levels/{world.world_id}.lean", _render_world(world))
         for level in world.levels:
+            position += 1
+            stage = stage_by_index.get(position - 1)
+            if stage is not None and stage.index == 0:
+                stage = None
             emit(
                 f"Game/Levels/{world.world_id}/{level.file_stem}.lean",
-                _render_level(game, level, previous),
+                _render_level(
+                    game,
+                    level,
+                    previous,
+                    staged_module=stage.module if stage is not None else None,
+                ),
             )
             previous = level
 

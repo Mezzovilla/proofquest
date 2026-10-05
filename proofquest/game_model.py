@@ -117,6 +117,35 @@ class World:
 
 
 @dataclass
+class DefsStage:
+    """Auxiliary declarations that become importable only after some levels.
+
+    ``index`` counts the levels (in global emission order) that must precede
+    the stage: ``0`` is the preamble ``Game/Generated/Defs.lean`` (imported
+    by ``Game.Metadata`` before any level), while ``index >= 1`` renders to
+    ``Game/Generated/DefsAfter<index:03d>.lean``, a module importing the
+    level at that global position — and with it every earlier level and
+    stage — so the blueprint theorems the staged declarations rely on are
+    already in scope.
+    """
+
+    index: int
+    level: Level | None = None
+    definitions: list[tuple[LeanDecl, BlueprintNode | None]] = field(
+        default_factory=list
+    )
+    imports: list[int] = field(default_factory=list)
+
+    @property
+    def module_stem(self) -> str:
+        return "Defs" if self.index == 0 else f"DefsAfter{self.index:03d}"
+
+    @property
+    def module(self) -> str:
+        return f"Game.Generated.{self.module_stem}"
+
+
+@dataclass
 class Game:
     title: str
     intro_md: str
@@ -126,3 +155,5 @@ class Game:
     tactics: list[str]  # all tactics used, in order of first appearance
     theorems: list[str]  # all external theorems referenced, in order of first appearance
     toolchain: str
+    stages: list[DefsStage] = field(default_factory=list)
+    world_dependencies: list[tuple[str, str]] = field(default_factory=list)
