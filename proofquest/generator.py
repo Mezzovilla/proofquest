@@ -2749,6 +2749,55 @@ require "leanprover-community" / mathlib @ git leanVersion
 lean_lib Game
 '''
 
+_LAKEFILE_LEGACY = '''import Lake
+open Lake DSL
+
+-- Using this assumes that each dependency has a tag of the form `v4.X.0`.
+def leanVersion : String := s!"v{Lean.versionString}"
+
+-- Use the GameServer from a `lean4game` folder lying next to the game on your
+-- local computer. Activated with `lake update -Klean4game.local`.
+-- Deactivate local version with `lake update -R`.
+meta if get_config? lean4game.local |>.isSome then
+require GameServer from "../lean4game/server"
+else
+require GameServer from git
+  "https://github.com/leanprover-community/lean4game.git" @ leanVersion / "server"
+
+package Game where
+  leanOptions := #[
+    ⟨`linter.all, false⟩,
+    ⟨`pp.showLetValues, true⟩,
+    ⟨`tactic.hygienic, false⟩]
+  moreLeanArgs := #[
+    "-Dtrace.debug=false"]
+  moreServerOptions := #[
+    ⟨`trace.debug, true⟩]
+
+require mathlib from git
+  "https://github.com/leanprover-community/mathlib4.git" @ leanVersion
+
+@[default_target]
+lean_lib Game
+'''
+
+
+def _legacy_lakefile_syntax(toolchain: str) -> bool:
+    """Whether the toolchain predates the reservoir ``require`` DSL.
+
+    ``scope``/``src?``/``version?`` ``Dependency`` fields and the
+    ``require "scope" / pkg @ git ver`` form were introduced with the
+    Reservoir refactor first released in Lean ``v4.10.0``. Older Lakes
+    (e.g. ``v4.7.0``) only accept ``require pkg from git url @ rev / sub``
+    plus ``meta if`` for conditional dependencies — a form still accepted
+    by current Lake as well.
+    """
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", toolchain)
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2))) < (4, 10)
+
+
 _GITIGNORE = """.lake/
 """
 
@@ -2804,7 +2853,14 @@ def write_game(game: Game, output_dir: Path) -> list[Path]:
             )
             previous = level
 
-    files.append(("lakefile.lean", _LAKEFILE))
+    files.append(
+        (
+            "lakefile.lean",
+            _LAKEFILE_LEGACY
+            if _legacy_lakefile_syntax(game.toolchain)
+            else _LAKEFILE,
+        )
+    )
     files.append(("lean-toolchain", game.toolchain.strip() + "\n"))
     files.append((".gitignore", _GITIGNORE))
     files.append(

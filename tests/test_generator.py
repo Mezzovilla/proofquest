@@ -2696,6 +2696,54 @@ def test_context_variable_resolution_uses_command_opens_not_later_ones():
     assert "variable (v : _root_.Foo.x)" in lines
 
 
+def test_lakefile_uses_legacy_dsl_for_lean_4_7(tmp_path):
+    blueprint = Blueprint(
+        nodes=[_def_node("def:d", ["d"], 0)], chapters=["Ch"]
+    )
+    decls = {
+        "d": _decl(
+            keyword="def", name="d", full_name="d",
+            source_text="def d : Nat := 0",
+        ),
+    }
+    game = build_game(
+        blueprint, decls, toolchain="leanprover/lean4:v4.7.0", title="T"
+    )
+    write_game(game, tmp_path)
+    lakefile = (tmp_path / "lakefile.lean").read_text()
+    assert "meta if get_config? lean4game.local" in lakefile
+    assert 'require GameServer from git' in lakefile
+    assert 'require mathlib from git' in lakefile
+    assert "DependencySrc" not in lakefile
+    assert (
+        tmp_path / "lean-toolchain"
+    ).read_text() == "leanprover/lean4:v4.7.0\n"
+
+
+def test_lakefile_uses_modern_dsl_for_lean_4_31(tmp_path):
+    blueprint = Blueprint(
+        nodes=[_def_node("def:d", ["d"], 0)], chapters=["Ch"]
+    )
+    decls = {
+        "d": _decl(
+            keyword="def", name="d", full_name="d",
+            source_text="def d : Nat := 0",
+        ),
+    }
+    game = build_game(
+        blueprint, decls, toolchain="leanprover/lean4:v4.31.0", title="T"
+    )
+    write_game(game, tmp_path)
+    lakefile = (tmp_path / "lakefile.lean").read_text()
+    assert 'src? := DependencySrc.path "../lean4game/server"' in lakefile
+    assert 'DependencySrc.git "https://github.com/leanprover-community/lean4game.git" leanVersion "server"' in lakefile
+    assert 'require "leanprover-community" / mathlib @ git leanVersion' in lakefile
+    assert "meta if" not in lakefile
+    assert (
+        tmp_path / "lean-toolchain"
+    ).read_text() == "leanprover/lean4:v4.31.0\n"
+
+
 def test_noncomputable_section_wraps_generated_definitions(tmp_path):
     blueprint = Blueprint(
         nodes=[_def_node("def:d", ["d"], 0)], chapters=["Ch"]
