@@ -213,6 +213,17 @@ def _proof_bound_names(proof: str) -> set[str]:
     return names
 
 
+def _level_bound_names(level: Level) -> set[str]:
+    """Names locally bound by a level's signature, variable lines or proof."""
+    decl = level.decl
+    bound = _binder_names(decl.signature)
+    for var_line in decl.variables:
+        bound |= _binder_names(var_line)
+    masked_proof = "\n".join(_masked_source(decl.proof or "")[0])
+    bound |= _proof_bound_names(masked_proof)
+    return bound
+
+
 def _term_spans(proof: str) -> list[str]:
     """Snippets of a proof that are Lean terms rather than tactic syntax.
 
@@ -1900,6 +1911,34 @@ def build_game(
         if 1 <= target_pos <= n_levels:
             level_at[target_pos].new_definitions.append(decl)
             introduced_defs.add(decl.full_name)
+
+    intro_pos_of: dict[str, int] = {}
+    for pos, level in level_at.items():
+        for new_def in level.new_definitions:
+            intro_pos_of.setdefault(new_def.full_name, pos)
+    for decl, _ in definitions:
+        if not decl.is_definition or "." in decl.full_name:
+            continue
+        intro_pos = intro_pos_of.get(decl.full_name)
+        if intro_pos is None:
+            continue
+        shadow_pos = next(
+            (
+                pos
+                for pos in sorted(level_at)
+                if stage_of[decl.full_name] < pos < intro_pos
+                and decl.full_name in _level_bound_names(level_at[pos])
+            ),
+            None,
+        )
+        if shadow_pos is None:
+            continue
+        level_at[shadow_pos].new_definitions.append(decl)
+        level_at[intro_pos].new_definitions = [
+            new_def
+            for new_def in level_at[intro_pos].new_definitions
+            if new_def is not decl
+        ]
 
     staged: dict[int, list[tuple[LeanDecl, BlueprintNode | None]]] = {}
     for pair in definitions:

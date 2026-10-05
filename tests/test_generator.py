@@ -1617,6 +1617,106 @@ def _world_node(label, chapter, order, uses=()):
     return node
 
 
+def _collision_game(marker_source, proofs):
+    a1 = _world_node("lem:a1", "First", 1)
+    a2 = _world_node("lem:a2", "First", 2)
+    b = _world_node("lem:b", "Second", 3, uses=["def:m"])
+    blueprint = Blueprint(
+        nodes=[a1, a2, _def_node("def:m", ["marker"], 0), b],
+        chapters=["First", "Second"],
+    )
+    decls = {
+        "a1": _decl(name="a1", full_name="a1", signature=": True",
+                    proof=proofs[0],
+                    source_text="theorem a1 : True := by\n  trivial"),
+        "marker": _decl(keyword="def", name="marker", full_name="marker",
+                        source_text=marker_source),
+        "a2": _decl(name="a2", full_name="a2", signature=": True",
+                    proof=proofs[1],
+                    source_text="theorem a2 : True := by\n  trivial"),
+        "b": _decl(name="b", full_name="b", signature=": True",
+                   proof=proofs[2],
+                   source_text="theorem b : True := by\n  trivial"),
+    }
+    return build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+
+def test_root_def_intro_moves_to_earlier_bound_name_collision():
+    """A root-level copied def whose name is locally bound in an earlier
+    level's proof is introduced there instead of at its nominal consumer:
+    GameServer's inventory scan resolves bare identifiers against the
+    environment regardless of local binders, so the earliest colliding
+    level is the honest introduction site."""
+    game = _collision_game(
+        "def marker : Nat := 0",
+        [
+            "by\n  have marker := rfl\n  trivial",
+            "by trivial",
+            "by trivial",
+        ],
+    )
+
+    first, second = game.worlds
+    assert first.world_id == "First" and second.world_id == "Second"
+    assert [d.full_name for d in first.levels[0].new_definitions] == ["marker"]
+    assert all(
+        d.full_name != "marker"
+        for level in second.levels
+        for d in level.new_definitions
+    )
+    assert ("Second", "First") not in game.world_dependencies
+    assert ("First", "Second") in game.world_dependencies
+
+
+def test_root_def_shadow_level_must_follow_its_stage():
+    """Only a collision level *after* the def's stage qualifies: the
+    shadowing level that coincides with the stage is skipped, and the
+    tile lands on the next eligible level while the stage is unchanged."""
+    game = _collision_game(
+        "def marker : Nat :=\n  if a1 then 1 else 0",
+        [
+            "by\n  have marker := rfl\n  trivial",
+            "by\n  have marker := rfl\n  trivial",
+            "by trivial",
+        ],
+    )
+
+    first, second = game.worlds
+    stage = next(
+        s for s in game.stages
+        if any(d.full_name == "marker" for d, _ in s.definitions)
+    )
+    assert stage.index == 1
+    assert [d.full_name for d in first.levels[0].new_definitions] == []
+    assert [d.full_name for d in first.levels[1].new_definitions] == ["marker"]
+    assert all(
+        d.full_name != "marker"
+        for level in second.levels
+        for d in level.new_definitions
+    )
+
+
+def test_root_def_intro_unchanged_without_earlier_collision():
+    """No eligible earlier bound-name collision leaves the nominal
+    introduction level untouched."""
+    game = _collision_game(
+        "def marker : Nat := 0",
+        [
+            "by trivial",
+            "by trivial",
+            "by trivial",
+        ],
+    )
+
+    first, second = game.worlds
+    assert all(
+        d.full_name != "marker"
+        for level in first.levels
+        for d in level.new_definitions
+    )
+    assert [d.full_name for d in second.levels[0].new_definitions] == ["marker"]
+
+
 def test_independent_interleaved_worlds_regroup_safely(tmp_path):
     """Worlds may reorder when a theorem prerequisite crosses chapter
     boundaries: A:a1, B:b1, A:a2 with a2 needing b1 emits B before A and
