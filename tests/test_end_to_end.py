@@ -51,18 +51,29 @@ def test_level_content(generated):
     assert "NewDefinition Toy.A" in level1
     assert "NewTactic unfold omega" in level1
 
+    level2 = (generated / "Game/Levels/AToyExample/L02_lemma2.lean").read_text()
+    assert "Statement lemma2 (n : Nat) : A (n + 1) := by" in level2
+
     level3 = (generated / "Game/Levels/AToyExample/L03_lemma3.lean").read_text()
     assert "import Game.Levels.AToyExample.L02_lemma2" in level3
+    assert "Statement lemma3 (n : Nat) : A n ∧ B (n + 1) := by" in level3
     assert "have h := lemma2 (n + 1)" in level3  # sample solution embedded
-    assert "Hint " in level3  # LaTeX proof became a hint
-    assert "NewTactic «have» exact" in level3  # keyword tactics are quoted
+    assert "constructor" in level3
+    assert "exact h" in level3
+    assert 'Hint "Just use lemma2."' in level3  # LaTeX proof became a hint
+    assert "NewTactic «have» constructor exact" in level3  # keyword tactics are quoted
     # `lemma2` is a project-local theorem (its own level); it must not be
     # re-declared with `NewTheorem`, since the GameServer unlocks it
     # automatically once its level is solved.
     assert "NewTheorem" not in level3
 
     main_level = (generated / "Game/Levels/AToyExample/L04_main.lean").read_text()
+    assert "import Game.Levels.AToyExample.L03_lemma3" in main_level
     assert "Statement main (n : Nat) : A n ∧ B (n + 1) := by" in main_level
+    assert "exact lemma1 n" in main_level
+    assert "exact (lemma3 n).2" in main_level
+    assert 'Hint "Easy from lemma1 and lemma3."' in main_level
+    assert "NewTheorem" not in main_level
 
 
 def test_defs_are_copied_verbatim(generated):
