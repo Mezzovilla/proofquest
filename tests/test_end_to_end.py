@@ -46,18 +46,21 @@ def test_level_content(generated):
     level1 = (generated / "Game/Levels/AToyExample/L01_lemma1.lean").read_text()
     assert 'World "AToyExample"' in level1
     assert "Level 1" in level1
-    assert "Statement lemma1 (n : Nat) : A n := by" in level1
+    assert "Statement lemma1 (n : Nat) : _root_.Toy.A n := by" in level1
     assert "namespace Toy" in level1
     assert "NewDefinition Toy.A" in level1
     assert "NewTactic unfold omega" in level1
 
     level2 = (generated / "Game/Levels/AToyExample/L02_lemma2.lean").read_text()
-    assert "Statement lemma2 (n : Nat) : A (n + 1) := by" in level2
+    assert "Statement lemma2 (n : Nat) : _root_.Toy.A (n + 1) := by" in level2
 
     level3 = (generated / "Game/Levels/AToyExample/L03_lemma3.lean").read_text()
     assert "import Game.Levels.AToyExample.L02_lemma2" in level3
-    assert "Statement lemma3 (n : Nat) : A n ∧ B (n + 1) := by" in level3
-    assert "have h := lemma2 (n + 1)" in level3  # sample solution embedded
+    assert (
+        "Statement lemma3 (n : Nat) : _root_.Toy.A n ∧ _root_.Toy.B (n + 1) := by"
+        in level3
+    )
+    assert "have h := _root_.Toy.lemma2 (n + 1)" in level3  # sample solution embedded
     assert "constructor" in level3
     assert "exact h" in level3
     assert 'Hint "Just use lemma2."' in level3  # LaTeX proof became a hint
@@ -69,9 +72,12 @@ def test_level_content(generated):
 
     main_level = (generated / "Game/Levels/AToyExample/L04_main.lean").read_text()
     assert "import Game.Levels.AToyExample.L03_lemma3" in main_level
-    assert "Statement main (n : Nat) : A n ∧ B (n + 1) := by" in main_level
-    assert "exact lemma1 n" in main_level
-    assert "exact (lemma3 n).2" in main_level
+    assert (
+        "Statement main (n : Nat) : _root_.Toy.A n ∧ _root_.Toy.B (n + 1) := by"
+        in main_level
+    )
+    assert "exact _root_.Toy.lemma1 n" in main_level
+    assert "exact (_root_.Toy.lemma3 n).2" in main_level
     assert 'Hint "Easy from lemma1 and lemma3."' in main_level
     assert "NewTheorem" not in main_level
 
@@ -125,7 +131,7 @@ def test_generate_rejects_project_local_syntax_without_writing(tmp_path, capsys)
     project = tmp_path / "proj"
     _write_rejection_project(
         project,
-        'local notation "η" => Nat\n\n'
+        'local notation "η" x => Nat\n\n'
         "namespace Toy\n\n"
         "def A : η :=\n  1\n\n"
         "theorem t : A = A := by\n  rfl\n\n"
@@ -141,12 +147,14 @@ def test_generate_rejects_project_local_syntax_without_writing(tmp_path, capsys)
 
 
 def test_generate_rejects_project_open_without_writing(tmp_path, capsys):
-    """`open Ks` of a project-local namespace cannot be reproduced
-    self-contained in the generated files: reject before writing."""
+    """A selective `open Ks (k)` of a project-local namespace cannot be
+    reproduced self-contained in the generated files: reject before
+    writing. (Plain `open Ks` is supported: it is replayed verbatim with a
+    namespace scaffold.)"""
     project = tmp_path / "proj"
     _write_rejection_project(
         project,
-        "open Ks\n\n"
+        "open Ks (k)\n\n"
         "namespace Toy\n\n"
         "def A : Nat :=\n  k + 1\n\n"
         "theorem t : A = A := by\n  rfl\n\n"
@@ -161,7 +169,35 @@ def test_generate_rejects_project_open_without_writing(tmp_path, capsys):
     assert not out.exists() or not any(out.rglob("*"))
     err = capsys.readouterr().err
     assert "Toy.A" in err
-    assert "Ks" in err
+    assert "open" in err
+    assert "Basic.lean:1" in err
+
+
+def test_generate_replays_project_open_with_scaffold(tmp_path):
+    """A plain `open Ks` of a project-local namespace is replayed verbatim
+    inside the declaration's section, preceded by an empty namespace
+    scaffold when the opened namespace has no copied declarations."""
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        "import Ks\n"
+        "open Ks\n\n"
+        "namespace Toy\n\n"
+        "def A : Nat :=\n  k + 1\n\n"
+        "theorem t : A = A := by\n  rfl\n\n"
+        "end Toy\n",
+    )
+    (project / "Ks.lean").write_text(
+        "namespace Ks\n\ndef k : Nat := 1\n\nend Ks\n", encoding="utf-8"
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+
+    defs = (out / "Game" / "Generated" / "Defs.lean").read_text()
+    assert "open Ks" in defs
+    assert "namespace Ks\n" in defs
+    assert "def k : Nat := 1" in defs
 
 
 def test_generate_replays_plain_global_notation_locally(tmp_path):
@@ -303,8 +339,8 @@ def test_generate_stages_notation_target_using_playable_theorem(tmp_path):
     assert "abbrev G" not in defs and "abbrev F" not in defs
     stage = (out / "Game/Generated/DefsAfter001.lean").read_text()
     assert "import Game.Levels.C.L01_t" in stage
-    assert "abbrev G : True :=\n  t" in stage
-    assert "abbrev F : True :=\n  G" in stage
+    assert "abbrev G : True :=\n  _root_.Toy.t" in stage
+    assert "abbrev F : True :=\n  _root_.Toy.G" in stage
     level = (out / "Game/Levels/C/L02_u.lean").read_text()
     assert "import Game.Generated.DefsAfter001" in level
     assert 'local notation "X" => _root_.Toy.F' in level
@@ -432,23 +468,23 @@ def test_generate_transports_instances_and_notation(tmp_path):
     assert "import Base" not in defs and "import Middle" not in defs
     assert re.search(r"^(local |scoped )?instance ", defs, re.MULTILINE) is None
     bs_def = re.search(
-        r"namespace Bs\n\ndef (_instance_m[0-9a-f]+_l\d+) : Tagged Nat := ⟨1⟩",
+        r"namespace Bs\n\ndef (_instance_m[0-9a-f]+_l\d+) : _root_.Tagged Nat := ⟨1⟩",
         defs,
     )
     assert bs_def, defs
     mid_def = re.search(
         r"def (_instance_m[0-9a-f]+_l\d+) "
-        r"\(α : Type\) \[Tagged α\] : Tagged \(List α\) := ⟨\[\]⟩",
+        r"\(α : Type\) \[_root_.Tagged α\] : _root_.Tagged \(List α\) := ⟨\[\]⟩",
         defs,
     )
     assert mid_def, defs
     assert "namespace Mid\n" in defs
     bool_def = re.search(
-        r"def (_instance_m[0-9a-f]+_l\d+) : Tagged Bool := ⟨true⟩", defs
+        r"def (_instance_m[0-9a-f]+_l\d+) : _root_.Tagged Bool := ⟨true⟩", defs
     )
     assert bool_def, defs
     char_def = re.search(
-        r"def (_instance_m[0-9a-f]+_l\d+) : Tagged Char := ⟨'c'⟩", defs
+        r"def (_instance_m[0-9a-f]+_l\d+) : _root_.Tagged Char := ⟨'c'⟩", defs
     )
     assert char_def, defs
     assert (
@@ -459,14 +495,14 @@ def test_generate_transports_instances_and_notation(tmp_path):
     )
     assert (
         "namespace Toy\n\n"
-        'local notation "!!" x => _root_.Ctx.double x\n'
         f"attribute [local instance] _root_.Bs.{bs_def.group(1)}\n"
+        'local notation "!!" x => _root_.Ctx.double x\n'
         f"attribute [local instance] _root_.Mid.{mid_def.group(1)}" in defs
     )
-    assert "def pick : Nat := (inferInstance : Tagged Nat).tag" in defs
+    assert "def pick : Nat := (inferInstance : _root_.Tagged Nat).tag" in defs
     assert 'local notation "##" x => _root_.Ctx.double x' in defs
     assert "def aliasUse : Nat := ## 5" in defs
-    assert "def c : Char := (inferInstance : Tagged Char).tag" in defs
+    assert "def c : Char := (inferInstance : _root_.Tagged Char).tag" in defs
     assert (
         f"attribute [local instance] _root_.Toy.{char_def.group(1)}" in defs
     )
@@ -513,23 +549,32 @@ def test_generate_transports_instances_and_notation(tmp_path):
     level = (out / "Game" / "Levels" / "C" / "L02_t2.lean").read_text()
     assert "open scoped" not in level
     assert f"attribute [local instance] _root_.Bs.{bs_def.group(1)}" in level
-    assert "Statement t2 : (inferInstance : Tagged Nat).tag = 1 := by" in level
+    assert (
+        "Statement t2 : (inferInstance : _root_.Tagged Nat).tag = 1 := by"
+        in level
+    )
 
     level_tc = (out / "Game" / "Levels" / "C" / "L03_tc.lean").read_text()
     assert f"attribute [local instance] _root_.Toy.{char_def.group(1)}" in level_tc
-    assert "Statement tc : (inferInstance : Tagged Char).tag = 'c' := by" in level_tc
+    assert (
+        "Statement tc : (inferInstance : _root_.Tagged Char).tag = 'c' := by"
+        in level_tc
+    )
 
     level_t3 = (out / "Game" / "Levels" / "C" / "L04_t3.lean").read_text()
     assert 'local notation "##" x => _root_.Ctx.double x' in level_t3
-    assert "Statement t3 : pick + pick = ## (1) := by" in level_t3
-    assert "change pick + pick = ## (1)" in level_t3
+    assert (
+        "Statement t3 : _root_.Toy.pick + _root_.Toy.pick = ## (1) := by"
+        in level_t3
+    )
+    assert "change _root_.Toy.pick + _root_.Toy.pick = ## (1)" in level_t3
 
 
 def test_generate_rejects_unsupported_instance_context(tmp_path, capsys):
     project = tmp_path / "proj"
     _write_scoped_context_project(
         project,
-        base_body="\ninstance viaWhere : Tagged Int where\n",
+        base_body="\nprotected instance viaWhere : Tagged Int where\n",
     )
     out = tmp_path / "game"
 
@@ -538,6 +583,21 @@ def test_generate_rejects_unsupported_instance_context(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "instance" in err
     assert "Base.lean:" in err
+
+
+def test_generate_transports_where_instance(tmp_path):
+    project = tmp_path / "proj"
+    _write_scoped_context_project(
+        project,
+        base_body="\ninstance viaWhere : Tagged Int where\n  tag := 3\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+
+    defs = (out / "Game" / "Generated" / "Defs.lean").read_text()
+    assert "def viaWhere : _root_.Tagged Int := {\n  tag := 3\n}" in defs
+    assert "attribute [local instance] _root_.viaWhere" in defs
 
 
 def _write_command_local_project(project: Path, lean_decls: str, lean_names: str) -> None:
@@ -556,7 +616,7 @@ def test_generate_rejects_command_local_open_target(tmp_path, capsys):
     _write_command_local_project(
         project,
         "namespace Toy\n\n"
-        "open Nat in\n"
+        "open Toy (A) in\n"
         "def A : Nat := succ 0\n\n"
         "theorem t : A = A := by\n  rfl\n\n"
         "end Toy\n",
@@ -572,6 +632,31 @@ def test_generate_rejects_command_local_open_target(tmp_path, capsys):
     assert "Toy.A" in err
     assert "open" in err
     assert "Basic.lean:3" in err
+
+
+def test_generate_replays_command_local_open_on_target(tmp_path):
+    """`open Nat in` before a declaration replays as a section-local
+    `open Nat` on that declaration only."""
+    project = tmp_path / "proj"
+    _write_command_local_project(
+        project,
+        "namespace Toy\n\n"
+        "open Nat in\n"
+        "def A : Nat := succ 0\n\n"
+        "theorem t : A = A := by\n  rfl\n\n"
+        "end Toy\n",
+        "\\begin{definition}\\label{def:A}\\lean{Toy.A}\n  A.\n\\end{definition}\n"
+        "\\begin{lemma}\\label{lem:t}\\lean{Toy.t}\\leanok\n"
+        "  T. \\uses{def:A}\n\\end{lemma}\n",
+    )
+    out = tmp_path / "game"
+
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+
+    defs = (out / "Game" / "Generated" / "Defs.lean").read_text()
+    assert "open Nat" in defs
+    assert "open Nat in" not in defs
+    assert "def A : Nat := succ 0" in defs
 
 
 def test_generate_command_local_open_leaves_following_decl_clean(tmp_path):
@@ -728,3 +813,87 @@ def test_generate_rejects_impossible_world_layout_before_writing(
     assert "world" in err
     assert "Basic.lean:" in err
     assert "Toy.dv" in err or "Toy.b1" in err
+
+
+def test_generate_renders_root_qualified_decl_in_source_namespace(tmp_path):
+    """`_root_.Inner.uses` declared inside `namespace Outer` keeps its
+    source context (Outer.resolution, relative opens) and its root header.
+    The level's Statement is emitted at root under the real full name —
+    `namespace Outer` + `Statement _root_.Inner.t` would make the
+    GameServer record a bogus `Outer._root_.Inner.t` statement name."""
+    project = tmp_path / "proj"
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        "\\chapter{C}\n"
+        "\\begin{definition}\\label{def:uses}\\lean{Inner.uses}\n"
+        "  U.\n"
+        "\\end{definition}\n"
+        "\\begin{lemma}\\label{lem:t}\\lean{Inner.t}\\leanok\n"
+        "  T. \\uses{def:uses}\n"
+        "\\end{lemma}\n",
+        encoding="utf-8",
+    )
+    (project / "Basic.lean").write_text(
+        "namespace Outer\n"
+        "def dep : Nat := 1\n"
+        "def _root_.Inner.uses : Nat := dep + 1\n"
+        "theorem _root_.Inner.t : Inner.uses = Inner.uses := by\n  rfl\n"
+        "end Outer\n",
+        encoding="utf-8",
+    )
+    (project / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n")
+    out = tmp_path / "game"
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+    defs = (out / "Game/Generated/Defs.lean").read_text()
+    assert "namespace Outer" in defs
+    assert "def dep : Nat := 1" in defs
+    assert "def _root_.Inner.uses : Nat := _root_.Outer.dep + 1" in defs
+    level = (out / "Game/Levels/C/L01_t.lean").read_text()
+    assert "namespace Outer" not in level
+    assert "open Outer" in level
+    assert "Statement Inner.t" in level
+    assert "_root_.Inner.uses = _root_.Inner.uses" in level
+
+
+def test_generate_split_definition_group_breaks_member_cycle(tmp_path):
+    """FLT3 grouping: members defined *from* level theorems live in their
+    own blueprint node so the def <-> level edge no longer cycles."""
+    project = tmp_path / "proj"
+    (project / "blueprint" / "src").mkdir(parents=True)
+    (project / "blueprint" / "src" / "content.tex").write_text(
+        "\\chapter{C}\n"
+        "\\begin{definition}\\label{def:yzw}\\lean{Toy.y, Toy.z, Toy.w}\n"
+        "  YZW.\n"
+        "\\end{definition}\n"
+        "\\begin{lemma}\\label{lmm:l}\\lean{Toy.l}\\leanok\n"
+        "  L. \\uses{def:yzw}\n"
+        "\\end{lemma}\n"
+        "\\begin{definition}\\label{def:x}\\lean{Toy.x}\n"
+        "  X. \\uses{lmm:l}\n"
+        "\\end{definition}\n"
+        "\\begin{lemma}\\label{lem:t}\\lean{Toy.t}\\leanok\n"
+        "  T. \\uses{def:x}\n"
+        "\\end{lemma}\n",
+        encoding="utf-8",
+    )
+    (project / "Basic.lean").write_text(
+        "namespace Toy\n"
+        "def y : Nat := 1\n"
+        "def z : Nat := 2\n"
+        "def w : Nat := 3\n"
+        "theorem l (n : Nat) : y = y := by\n  rfl\n"
+        "def x : Nat := by\n  have _ := l y\n  exact 1\n"
+        "theorem t : x = x := by\n  rfl\n"
+        "end Toy\n",
+        encoding="utf-8",
+    )
+    (project / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n")
+    out = tmp_path / "game"
+    assert main(["generate", str(project), "-o", str(out)]) == 0
+    defs = (out / "Game/Generated/Defs.lean").read_text()
+    staged = (out / "Game/Generated/DefsAfter001.lean").read_text()
+    assert "def y" in defs
+    assert "def z" in defs
+    assert "def w" in defs
+    assert "def x" in staged
+    assert "import Game.Levels.C.L01_l" in staged

@@ -48,6 +48,9 @@ class LeanNotation:
     pattern: str
     target: str
     arguments: tuple[str, ...]
+    expression: str | None = None
+    variables: tuple[str, ...] = ()
+    opens: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,11 @@ class LeanContextCommand:
     source_text: str
     exported: bool
     supported: bool
+    targets: tuple[str, ...] = ()
+    instance_action: str | None = None
+    priority: int | None = None
+    variables: tuple[str, ...] = ()
+    opens: tuple[str, ...] = ()
 
 
 @dataclass
@@ -87,6 +95,8 @@ class LeanDecl:
     scope: tuple[str, ...] = ()
     context: tuple[LeanContextCommand, ...] = ()
     instances: list[LeanDecl] = field(default_factory=list)
+    context_namespace: str | None = None
+    noncomputable_section: bool = False
 
     @property
     def is_definition(self) -> bool:
@@ -157,3 +167,5 @@ class Game:
     toolchain: str
     stages: list[DefsStage] = field(default_factory=list)
     world_dependencies: list[tuple[str, str]] = field(default_factory=list)
+    project_scopes: frozenset[str] = frozenset()
+    decls: dict[str, LeanDecl] = field(default_factory=dict)

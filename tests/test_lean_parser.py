@@ -2,7 +2,13 @@ import pytest
 
 from proofquest.game_model import Game
 from proofquest.generator import _render_defs
-from proofquest.lean_parser import LeanParseError, _parse_file, parse_project
+from proofquest.lean_parser import (
+    LeanParseError,
+    _masked_source,
+    _ns_interpretations,
+    _parse_file,
+    parse_project,
+)
 
 SOURCE = """namespace Toy
 
@@ -248,7 +254,11 @@ def test_render_defs_root_qualified(tmp_path):
     rendered = _render_defs(game)
     assert "noncomputable\ndef _root_.Solution'_final" in rendered
     assert 'DefinitionDoc Solution\'_final as "Solution\'_final"' in rendered
-    assert "namespace Solution" not in rendered
+    assert (
+        rendered.index("namespace Solution")
+        < rendered.index("def _root_.Solution'_final")
+        < rendered.index("end Solution")
+    )
 
 
 def test_notation_command_ends_declaration_block(tmp_path):
@@ -267,7 +277,7 @@ def test_notation_command_ends_declaration_block(tmp_path):
 def test_local_syntax_commands_are_recorded(tmp_path):
     path = tmp_path / "Basic.lean"
     path.write_text(
-        'local notation "η" => Nat\n\n'
+        'local notation "η" x => Nat\n\n'
         "namespace Toy\n\n"
         "def base : η := 1\n\n"
         "end Toy\n",
@@ -458,7 +468,7 @@ def test_supported_and_unsupported_notation_still_reject(tmp_path):
         "namespace Toy\n"
         "abbrev NormMap (T : Type*) := T\n"
         'notation "‖" T "·‖" => NormMap T\n'
-        'local notation "N" => NormMap Nat\n'
+        'local notation "N" x => NormMap Nat\n'
         "theorem uses_norm (T : Type*) (x : ‖T·‖) : True := by\n"
         "  trivial\n"
         "end Toy\n",
@@ -628,7 +638,7 @@ def test_instance_forms_parse_and_reject_correctly(tmp_path):
         "class C (α : Type) where\n"
         "instance (α : Type) [C α] : C (List α) := ⟨⟩\n"
         "local instance named : C Nat := ⟨⟩\n"
-        "instance viaWhere : C Bool where\n"
+        "protected instance viaWhere : C Bool where\n"
         "section\n"
         "attribute [simp] Nat.add_comm\n"
         "instance attrFree : C Char := ⟨⟩\n"
@@ -762,7 +772,7 @@ def test_imported_scoped_activation_requires_open_scoped(tmp_path):
     decls = parse_project(tmp_path)
     assert decls["plain"].local_syntax == []
     scoped = decls["sc"]
-    assert scoped.local_syntax == ["notation"]
+    assert scoped.local_syntax == ["notation", "open"]
     origin = next(
         c for c in scoped.context if not c.supported and c.kind == "notation"
     )
@@ -816,12 +826,13 @@ def test_command_local_open_binds_only_next_declaration(tmp_path):
     )
     decls = parse_project(tmp_path)
     target, follow = decls["target"], decls["follow"]
-    assert target.local_syntax == ["open"]
-    assert target.opens == []
+    assert target.local_syntax == []
+    assert target.opens == ["open Nat"]
     origin = next(c for c in target.context if c.kind == "open")
-    assert not origin.supported
+    assert origin.supported
     assert origin.source_path == "Basic.lean"
     assert origin.line == 0
+    assert origin.source_text == "open Nat"
     assert follow.local_syntax == []
     assert follow.opens == []
     assert _no_command_local_in(follow)
@@ -844,9 +855,9 @@ def test_command_local_open_skips_blank_comments_modifiers_and_attrs(tmp_path):
         encoding="utf-8",
     )
     decls = parse_project(tmp_path)
-    assert decls["target"].local_syntax == ["open"]
-    assert decls["attrTarget"].local_syntax == ["open"]
-    assert decls["attrLine"].local_syntax == ["open"]
+    for name in ("target", "attrTarget", "attrLine"):
+        assert decls[name].local_syntax == []
+        assert decls[name].opens == ["open Nat"]
     follow = decls["follow"]
     assert follow.local_syntax == []
     assert follow.opens == []
@@ -863,9 +874,23 @@ def test_command_local_open_inside_namespace(tmp_path):
         encoding="utf-8",
     )
     decls = parse_project(tmp_path)
-    assert decls["Ns.target"].local_syntax == ["open"]
+    assert decls["Ns.target"].local_syntax == []
+    assert decls["Ns.target"].opens == ["open Nat"]
     assert decls["Ns.follow"].local_syntax == []
     assert _no_command_local_in(decls["Ns.follow"])
+
+
+def test_command_local_open_rejects_selective_and_scoped(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Ks\n"
+        "def k : Nat := 1\n"
+        "end Ks\n"
+        "open Ks (k) in\n"
+        "theorem target : Nat.succ 0 = 1 := rfl\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["target"].local_syntax == ["open"]
 
 
 def test_command_local_variable_is_conservatively_unsupported(tmp_path):
@@ -920,3 +945,408 @@ def test_ordinary_open_still_applies_normally(tmp_path):
     assert decls["target"].opens == ["open Nat"]
     assert decls["follow"].opens == ["open Nat"]
     assert decls["follow"].local_syntax == []
+
+
+def test_local_expression_notation_is_supported(tmp_path):
+    """FLT3-shaped `local notation3` aliases: a single quoted identifier
+    literal mapped to a flat term expression."""
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Cyclo\n\n"
+        "variable (hζ : Nat)\n\n"
+        'local notation3 "K" => CyclotomicField 3 ℚ\n'
+        'local notation3 "η" => hζ.toInteger\n'
+        'local notation3 "λ" => η - 1\n\n'
+        "theorem uses : K = K := by\n  rfl\n\n"
+        "end Cyclo\n\n"
+        "theorem outside : Nat := 1\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    uses = decls["Cyclo.uses"]
+    assert uses.local_syntax == []
+    expressions = {n.pattern: n.expression for n in uses.notations}
+    assert expressions['"K"'] == "CyclotomicField 3 ℚ"
+    assert expressions['"η"'] == "hζ.toInteger"
+    assert expressions['"λ"'] == "η - 1"
+    assert uses.notations[0].namespace == "Cyclo"
+    assert uses.notations[1].variables == ("variable (hζ : Nat)",)
+    assert decls["outside"].notations == []
+    assert decls["outside"].local_syntax == []
+
+
+def test_local_expression_notation_rejects_unsupported_forms(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        'local notation3 "F" => fun x => x\n'
+        'local notation "G" => match Nat.zero with | z => z\n'
+        'local notation "H" x => x\n'
+        'local notation "I" => A → B\n'
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    late = parse_project(tmp_path)["late"]
+    assert late.local_syntax == ["notation3", "notation"]
+    assert late.notations == []
+
+
+def test_local_notation_conflicting_expression_rejects(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        'local notation "K" => Nat\n'
+        'local notation "K" => Int\n'
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    assert parse_project(tmp_path)["late"].local_syntax == ["notation"]
+
+
+def test_where_instance_is_supported(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "class C (α : Type) where\n"
+        "  tag : α\n"
+        "instance viaWhere : C Bool where\n"
+        "  tag := true\n"
+        "instance emptyWhere : C Char where\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    via = decls["viaWhere"]
+    assert via.signature == ": C Bool"
+    assert via.proof == "{\n  tag := true\n}"
+    assert decls["emptyWhere"].proof == "{}"
+    assert decls["late"].local_syntax == []
+
+
+def test_instance_attributes_are_supported(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "class C (α : Type) where\n"
+        "  tag : α\n"
+        "instance foo : C Nat := ⟨0⟩\n"
+        "attribute [-instance] foo\n"
+        "section\n"
+        "attribute [local instance] foo\n"
+        "attribute [instance 77] foo\n"
+        "theorem late : True := by\n  trivial\n"
+        "end\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    late = decls["late"]
+    assert late.local_syntax == []
+    attrs = [c for c in late.context if c.kind == "attribute"]
+    assert len(attrs) == 3
+    assert attrs[0].instance_action == "disable"
+    assert attrs[0].targets == ("_root_.foo",)
+    assert attrs[1].instance_action == "enable"
+    assert attrs[1].priority is None
+    assert attrs[2].priority == 77
+
+
+def test_non_instance_attributes_still_reject(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "attribute [simp] Nat.add_comm\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    assert parse_project(tmp_path)["late"].local_syntax == ["attribute"]
+
+
+def test_plain_project_open_is_supported(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Ks\n"
+        "def k : Nat := 1\n"
+        "end Ks\n"
+        "open Ks\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    late = parse_project(tmp_path)["late"]
+    assert late.local_syntax == []
+    assert late.opens == ["open Ks"]
+
+
+def test_selective_project_open_still_rejects(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Ks\n"
+        "def k : Nat := 1\n"
+        "end Ks\n"
+        "open Ks (k)\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    assert parse_project(tmp_path)["late"].local_syntax == ["open"]
+
+
+def test_scoped_open_of_project_scoped_namespace_rejects(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Ns\n"
+        'scoped notation "S" => Nat\n'
+        "end Ns\n"
+        "open scoped Ns\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    assert parse_project(tmp_path)["late"].local_syntax == ["notation", "open"]
+
+
+def test_external_scoped_open_is_supported(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "open scoped BigOperators Nat\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    assert parse_project(tmp_path)["late"].local_syntax == []
+
+
+def test_root_qualified_decl_keeps_enclosing_namespace_context(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "namespace Outer\n"
+        "def dep : Nat := 1\n"
+        "def _root_.Inner.uses : Nat := dep + 1\n"
+        "end Outer\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["Inner.uses"].context_namespace == "Outer"
+    assert decls["Inner.uses"].namespace == "Inner"
+
+
+def test_where_instance_ignores_where_in_string_and_comment(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "class C (α : Type) where\n"
+        "  tag : α\n"
+        'instance quoted : C "where" where\n'
+        '  tag := "where"\n'
+        "instance commented : C /- where -/ Bool where\n"
+        "  tag := true\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["quoted"].signature == ': C "where"'
+    assert decls["quoted"].proof == '{\n  tag := "where"\n}'
+    assert decls["commented"].signature == ": C /- where -/ Bool"
+    assert decls["commented"].proof == "{\n  tag := true\n}"
+
+
+def test_instance_context_command_matches_decl_by_line_range(tmp_path):
+    """A separate `noncomputable` modifier line and an inline comment must
+    not break the link between an `instance` context command and its
+    declaration."""
+    (tmp_path / "Basic.lean").write_text(
+        "class C (α : Type) where\n"
+        "  tag : α\n"
+        "noncomputable\n"
+        "-- an instance with a separate modifier line\n"
+        "instance instX : C Nat where\n"
+        "  tag := 0\n"
+        "attribute [-instance] instX\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    inst = decls["instX"]
+    late = decls["late"]
+    inst_commands = [c for c in late.context if c.kind == "instance"]
+    assert len(inst_commands) == 1
+    assert inst_commands[0].targets == ("instX",)
+    assert inst_commands[0].line <= inst.line <= inst_commands[0].end_line
+    attrs = [c for c in late.context if c.kind == "attribute"]
+    assert attrs[0].instance_action == "disable"
+    assert late.local_syntax == []
+
+
+def test_attribute_target_prefers_enclosing_namespace(tmp_path):
+    """Inside `namespace N`, `attribute [instance] foo` resolves `foo` the
+    way Lean does — `N.foo` shadows the root `foo`; it is not ambiguous."""
+    (tmp_path / "Basic.lean").write_text(
+        "class C (α : Type) where\n"
+        "  tag : α\n"
+        "instance foo : C Bool := ⟨true⟩\n"
+        "namespace N\n"
+        "instance foo : C Nat := ⟨0⟩\n"
+        "attribute [instance] foo\n"
+        "theorem late : True := by\n  trivial\n"
+        "end N\n",
+        encoding="utf-8",
+    )
+    late = parse_project(tmp_path)["N.late"]
+    assert late.local_syntax == []
+    attrs = [c for c in late.context if c.kind == "attribute"]
+    assert attrs[0].targets == ("_root_.N.foo",)
+
+
+def test_attribute_unknown_bare_target_fails_closed(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "attribute [instance] typo\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    assert parse_project(tmp_path)["late"].local_syntax == ["attribute"]
+
+
+def test_attribute_qualified_external_target_is_kept(tmp_path):
+    (tmp_path / "Basic.lean").write_text(
+        "attribute [-instance] ValuationRing.instIsBezoutToRing\n"
+        "theorem late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    late = parse_project(tmp_path)["late"]
+    assert late.local_syntax == []
+    attrs = [c for c in late.context if c.kind == "attribute"]
+    assert attrs[0].targets == ("_root_.ValuationRing.instIsBezoutToRing",)
+    assert attrs[0].instance_action == "disable"
+
+
+def test_open_root_token_interpretations_are_absolute(tmp_path):
+    assert _ns_interpretations("_root_.Ks", "Outer") == ["Ks"]
+    assert _ns_interpretations("Ks", "Outer") == ["Outer.Ks", "Ks"]
+    assert _ns_interpretations("Ks", "") == ["Ks"]
+
+
+def test_root_open_canonicalizes_absolute_for_nested_consumer(tmp_path):
+    (tmp_path / "M.lean").write_text(
+        "open Units\n"
+        "namespace NumberField.Units\n"
+        "theorem t : True := trivial\n"
+        "end NumberField.Units\n",
+        encoding="utf-8",
+    )
+    decl = parse_project(tmp_path)["NumberField.Units.t"]
+    assert decl.opens == ["open _root_.Units"]
+
+
+def test_relative_open_resolves_against_command_namespace(tmp_path):
+    (tmp_path / "M.lean").write_text(
+        "namespace Outer\n"
+        "namespace Sub\n"
+        "theorem s : True := trivial\n"
+        "end Sub\n"
+        "open Sub\n"
+        "namespace Inner\n"
+        "theorem t : True := trivial\n"
+        "end Inner\n"
+        "end Outer\n",
+        encoding="utf-8",
+    )
+    decl = parse_project(tmp_path)["Outer.Inner.t"]
+    assert decl.opens == ["open _root_.Outer.Sub"]
+
+
+def test_relative_open_under_project_namespace_emits_at_root(tmp_path):
+    (tmp_path / "M.lean").write_text(
+        "namespace Outer\n"
+        "open Sub\n"
+        "namespace Inner\n"
+        "theorem t : True := trivial\n"
+        "end Inner\n"
+        "end Outer\n",
+        encoding="utf-8",
+    )
+    decl = parse_project(tmp_path)["Outer.Inner.t"]
+    assert decl.opens == ["open _root_.Sub"]
+
+
+def test_noncomputable_section_marks_decls_until_end(tmp_path):
+    (tmp_path / "M.lean").write_text(
+        "noncomputable section\n"
+        "theorem a : True := trivial\n"
+        "namespace N\n"
+        "theorem b : True := trivial\n"
+        "end N\n"
+        "end\n"
+        "theorem c : True := trivial\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert decls["a"].noncomputable_section
+    assert decls["N.b"].noncomputable_section
+    assert not decls["c"].noncomputable_section
+
+
+def test_noncomputable_modifier_line_before_instance(tmp_path):
+    (tmp_path / "M.lean").write_text(
+        "class C (α : Type) where\n  tag : α\n\n"
+        "noncomputable\n"
+        "instance instX : C Nat where\n  tag := 0\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    assert "instX" in decls
+    assert "noncomputable" in decls["instX"].modifiers
+
+
+def test_masked_source_preserves_offsets():
+    source = (
+        "noncomputable\n"
+        "/- comment /- inner -/ -/\n"
+        'def s : String := "a /- still string -/ \\\\" ++ "x"\n'
+        "-- a line comment /- not block -/\n"
+        "instance inst : True := by\n  trivial\n"
+    )
+    masked, _sheltered = _masked_source(source)
+    assert len("\n".join(masked)) == len(source)
+    original_lines = source.split("\n")
+    assert len(masked) == len(original_lines)
+    for masked_line, original_line in zip(masked, original_lines):
+        assert len(masked_line) == len(original_line)
+
+
+def test_nested_comment_before_instance_keeps_exact_signature(tmp_path):
+    (tmp_path / "M.lean").write_text(
+        "class C (α : Type) where\n  tag : α\n\n"
+        "noncomputable\n"
+        "/- comment /- inner -/ -/\n"
+        "instance instX : C Nat where\n  tag := 0\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    inst = decls["instX"]
+    assert inst.signature == ": C Nat"
+    assert inst.proof == "{\n  tag := 0\n}"
+    assert "noncomputable" in inst.modifiers
+
+
+def test_instance_disable_is_scope_local_and_not_exported(tmp_path):
+    (tmp_path / "M.lean").write_text(
+        "class C (α : Type) where\n  tag : α\n"
+        "instance instX : C Nat where\n  tag := 0\n"
+        "section\n"
+        "attribute [-instance] instX\n"
+        "theorem inside : True := by\n  trivial\n"
+        "end\n"
+        "theorem after : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    inside_attrs = [
+        c for c in decls["inside"].context if c.kind == "attribute"
+    ]
+    assert inside_attrs[0].instance_action == "disable"
+    assert inside_attrs[0].exported is False
+    assert not [
+        c for c in decls["after"].context if c.kind == "attribute"
+    ]
+
+
+def test_instance_disable_does_not_leak_to_importer(tmp_path):
+    lib = tmp_path / "Lib"
+    lib.mkdir()
+    (lib / "A.lean").write_text(
+        "class C (α : Type) where\n  tag : α\n"
+        "instance instX : C Nat where\n  tag := 0\n"
+        "attribute [-instance] instX\n"
+        "theorem own_late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "B.lean").write_text(
+        "import Lib.A\n"
+        "theorem importer_late : True := by\n  trivial\n",
+        encoding="utf-8",
+    )
+    decls = parse_project(tmp_path)
+    own_attrs = [
+        c for c in decls["own_late"].context if c.kind == "attribute"
+    ]
+    assert [c.instance_action for c in own_attrs] == ["disable"]
+    assert not [
+        c for c in decls["importer_late"].context if c.kind == "attribute"
+    ]

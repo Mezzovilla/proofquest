@@ -1,12 +1,25 @@
 import pytest
 
-from proofquest.game_model import Blueprint, BlueprintNode, LeanDecl
+from proofquest.game_model import (
+    Blueprint,
+    BlueprintNode,
+    LeanContextCommand,
+    LeanDecl,
+    LeanNotation,
+    Level,
+)
 from proofquest.generator import (
     GenerationError,
     _binder_names,
+    _binder_types,
+    _context_lines,
     _is_declared_theorem,
     _looks_like_theorem_name,
+    _obtain_binder_types,
+    _qualify_project_refs,
     _resolve_project_decl,
+    _source_refs,
+    _statement_proof,
     _strip_accessor_suffix,
     _theorem_refs_in_proof,
     build_game,
@@ -847,8 +860,39 @@ def test_copied_dep_with_local_syntax_is_error():
 
 
 def test_copied_decl_with_project_open_is_error():
-    """`open Ks` where `Ks` is a project namespace cannot be reproduced
-    self-contained (only the copied subset would be opened): reject."""
+    """A *selective* `open Ks (k)` of a project namespace cannot be
+    reproduced self-contained (the generated namespace only holds the
+    copied subset): reject. Plain `open Ks` is supported — see
+    `test_plain_project_open_resolves_and_scaffolds`."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Ks.k": _decl(keyword="def", name="k", full_name="Ks.k", namespace="Ks",
+                      source_text="def k : Nat :=\n  1"),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            opens=["open Ks (k)"],
+            source_text="def B : Nat :=\n  k + 1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError) as exc_info:
+        build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    message = str(exc_info.value)
+    assert "def:b" in message
+    assert "Toy.B" in message
+    assert "Ks" in message
+
+
+def test_plain_project_open_resolves_through_opened_namespace():
+    """`open Ks` of a project namespace resolves `k` to `Ks.k`, and the
+    opened namespace gets an empty scaffold in the rendered file."""
     blueprint = Blueprint(
         nodes=[
             _def_node("def:b", ["Toy.B"], 0),
@@ -867,12 +911,69 @@ def test_copied_decl_with_project_open_is_error():
         "t": _decl(name="t", full_name="t", proof="by exact trivial"),
     }
 
-    with pytest.raises(GenerationError) as exc_info:
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["Ks.k", "Toy.B"]
+
+
+def test_relative_project_open_resolves_through_enclosing_namespace():
+    """`open Rat` inside `namespace IsCyclotomicExtension` opens
+    `IsCyclotomicExtension.Rat` (relative) as well as root `Rat`."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "IsCyclotomicExtension.Rat.lemma": _decl(
+            keyword="def", name="lemma",
+            full_name="IsCyclotomicExtension.Rat.lemma",
+            namespace="IsCyclotomicExtension.Rat",
+            source_text="def lemma : Nat :=\n  1",
+        ),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            opens=["open Rat"],
+            context_namespace="IsCyclotomicExtension",
+            source_text="def B : Nat :=\n  lemma + 1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    copied = [decl.full_name for decl, _ in game.definitions]
+    assert copied == ["IsCyclotomicExtension.Rat.lemma", "Toy.B"]
+
+
+def test_ambiguous_opened_namespaces_reject():
+    """When two opened project namespaces both provide `k`, the reference
+    is ambiguous: reject rather than pick one arbitrarily."""
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            _theorem_node("lem:t", 1, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "A.k": _decl(keyword="def", name="k", full_name="A.k", namespace="A",
+                     source_text="def k : Nat :=\n  1"),
+        "B.k": _decl(keyword="def", name="k", full_name="B.k", namespace="B",
+                     source_text="def k : Nat :=\n  2"),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            opens=["open A", "open B"],
+            source_text="def B : Nat :=\n  k + 1",
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    with pytest.raises(GenerationError, match="ambiguous"):
         build_game(blueprint, decls, toolchain="v4.31.0", title="T")
-    message = str(exc_info.value)
-    assert "def:b" in message
-    assert "Toy.B" in message
-    assert "Ks" in message
 
 
 def test_copied_decl_with_external_open_is_fine():
@@ -897,6 +998,203 @@ def test_copied_decl_with_external_open_is_fine():
 
     copied = [decl.full_name for decl, _ in game.definitions]
     assert copied == ["Toy.B"]
+
+
+def _open_command(source_text, namespace=""):
+    return LeanContextCommand(
+        module="M",
+        source_path="M.lean",
+        line=0,
+        end_line=0,
+        namespace=namespace,
+        scope=(),
+        kind="open",
+        source_text=source_text,
+        exported=False,
+        supported=True,
+    )
+
+
+def test_suffix_open_resolves_via_original_context_commands():
+    """Lean's `open` has suffix semantics: after `open NumberField`, a later
+    `open Units` also opens `NumberField.Units`. The canonical render form
+    `open _root_.Units` loses that, so lookup must use the original context
+    commands (which keep `source_text` and the command's own namespace)."""
+    rank = _decl(
+        keyword="def", name="rank", full_name="NumberField.Units.rank",
+        namespace="NumberField.Units", source_text="def rank : Nat :=\n  1",
+    )
+    caller = _decl(
+        keyword="def", name="mem",
+        full_name="IsCyclotomicExtension.Rat.Three.mem",
+        namespace="IsCyclotomicExtension.Rat.Three",
+        opens=["open _root_.NumberField", "open _root_.Units"],
+        context=(
+            _open_command("open NumberField"),
+            _open_command("open Units"),
+        ),
+    )
+    decls = {rank.full_name: rank}
+    assert _resolve_project_decl("rank", caller, decls) is rank
+
+
+def test_suffix_open_single_command_expands_tokens_in_order():
+    rank = _decl(
+        keyword="def", name="rank", full_name="NumberField.Units.rank",
+        namespace="NumberField.Units", source_text="def rank : Nat :=\n  1",
+    )
+    caller = _decl(
+        keyword="def", name="mem",
+        full_name="IsCyclotomicExtension.Rat.Three.mem",
+        namespace="IsCyclotomicExtension.Rat.Three",
+        opens=["open _root_.NumberField _root_.Units"],
+        context=(_open_command("open NumberField Units"),),
+    )
+    decls = {rank.full_name: rank}
+    assert _resolve_project_decl("rank", caller, decls) is rank
+
+
+def test_open_command_namespace_differs_from_decl_namespace():
+    """A command written in `namespace NumberField` opens `NumberField.Sub`
+    even for a consumer declared deeper in the tree."""
+    lemma = _decl(
+        keyword="def", name="lemma", full_name="NumberField.Sub.lemma",
+        namespace="NumberField.Sub", source_text="def lemma : Nat :=\n  1",
+    )
+    caller = _decl(
+        keyword="def", name="mem",
+        full_name="NumberField.Units.Deep.mem",
+        namespace="NumberField.Units.Deep",
+        opens=["open _root_.NumberField.Sub"],
+        context=(_open_command("open Sub", namespace="NumberField"),),
+    )
+    decls = {lemma.full_name: lemma}
+    assert _resolve_project_decl("lemma", caller, decls) is lemma
+
+
+def test_scoped_open_command_does_not_resolve_plain_names():
+    foo = _decl(
+        keyword="def", name="foo", full_name="Sco.foo", namespace="Sco",
+        source_text="def foo : Nat :=\n  1",
+    )
+    caller = _decl(
+        name="c", full_name="c",
+        opens=["open scoped Sco"],
+        context=(_open_command("open scoped Sco"),),
+    )
+    assert _resolve_project_decl("foo", caller, {foo.full_name: foo}) is None
+
+
+def test_ambiguous_opened_namespaces_via_commands_reject():
+    decls = {
+        "A.k": _decl(keyword="def", name="k", full_name="A.k", namespace="A",
+                     source_text="def k : Nat :=\n  1"),
+        "B.k": _decl(keyword="def", name="k", full_name="B.k", namespace="B",
+                     source_text="def k : Nat :=\n  2"),
+    }
+    caller = _decl(
+        name="c", full_name="c",
+        opens=["open _root_.A", "open _root_.B"],
+        context=(_open_command("open A"), _open_command("open B")),
+    )
+    with pytest.raises(GenerationError, match="ambiguous"):
+        _resolve_project_decl("k", caller, decls)
+
+
+def test_dotted_decl_prefix_resolves_bare_refs():
+    lemma = _decl(
+        name="multiplicity_lambda_c_finite",
+        full_name="Solution'.multiplicity_lambda_c_finite",
+        namespace="", proof="by trivial",
+    )
+    caller = _decl(
+        keyword="def", name="Solution'.multiplicity",
+        full_name="Solution'.multiplicity", namespace="",
+    )
+    decls = {lemma.full_name: lemma}
+    assert (
+        _resolve_project_decl("multiplicity_lambda_c_finite", caller, decls)
+        is lemma
+    )
+
+
+def test_decl_prefix_shadows_enclosing_namespace():
+    inner = _decl(
+        name="dep", full_name="Outer.Inner.dep", namespace="Outer.Inner"
+    )
+    outer = _decl(name="dep", full_name="Outer.dep", namespace="Outer")
+    caller = _decl(
+        name="Inner.uses", full_name="Outer.Inner.uses", namespace="Outer",
+        context_namespace="Outer",
+    )
+    decls = {inner.full_name: inner, outer.full_name: outer}
+    assert _resolve_project_decl("dep", caller, decls) is inner
+
+
+def test_root_decl_prefix_then_enclosing_namespace():
+    outer_dep = _decl(name="dep", full_name="Outer.dep", namespace="Outer")
+    caller = _decl(
+        name="uses", full_name="Inner.uses", namespace="Inner",
+        context_namespace="Outer",
+    )
+    assert (
+        _resolve_project_decl("dep", caller, {"Outer.dep": outer_dep})
+        is outer_dep
+    )
+
+
+def test_root_qualified_refs_are_never_rewritten():
+    decls = {
+        "Outer.dep": _decl(name="dep", full_name="Outer.dep",
+                           namespace="Outer"),
+    }
+    caller = _decl(name="uses", full_name="Inner.uses", namespace="Inner")
+    out = _qualify_project_refs(
+        "def uses := _root_.Outer.dep + dep", set(), caller, decls
+    )
+    assert "_root_.Outer.dep" in out
+    assert "_root_._root_" not in out
+
+
+def test_free_constant_projection_still_qualified():
+    decls = {
+        "hζ": _decl(keyword="def", name="hζ", full_name="hζ",
+                    source_text="def hζ : Nat :=\n  1"),
+    }
+    caller = _decl(name="w", full_name="w")
+    assert (
+        _qualify_project_refs("hζ.toInteger", set(), caller, decls)
+        == "_root_.hζ.toInteger"
+    )
+
+
+def test_level_statement_for_root_named_decl_is_emitted_at_root(tmp_path):
+    blueprint = Blueprint(
+        nodes=[_theorem_node("lem:Inner.uses", 0)],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Outer.dep": _decl(
+            keyword="def", name="dep", full_name="Outer.dep",
+            namespace="Outer", source_text="def dep : Nat :=\n  1",
+        ),
+        "Inner.uses": _decl(
+            name="uses", full_name="Inner.uses", namespace="Inner",
+            context_namespace="Outer",
+            signature=": Nat",
+            proof="by exact Outer.dep.succ_eq_add_one",
+            source_text="theorem uses : Nat := by exact Outer.dep.succ_eq_add_one",
+        ),
+    }
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    written = write_game(game, tmp_path)
+    level_file = tmp_path / "Game/Levels/Ch/L01_uses.lean"
+    assert level_file in written
+    content = level_file.read_text()
+    assert "Statement Inner.uses" in content
+    assert "Statement _root_." not in content
+    assert "namespace Outer\n\n/-- " not in content.split("Statement")[0]
+    assert "open Outer" in content
 
 
 def test_level_theorem_with_local_syntax_is_error():
@@ -1079,14 +1377,16 @@ def test_staged_write_game_emits_module_imported_by_next_level(tmp_path):
     stage = (tmp_path / "Game/Generated/DefsAfter001.lean").read_text()
     assert "import Game.Levels.Ch.L01_helper" in stage
     assert "import GameServer.Commands" in stage
-    assert "def depval : True :=\n  helper" in stage
+    assert "def depval : True :=\n  _root_.helper" in stage
     assert 'DefinitionDoc Toy.depval as "depval"' in stage
     level1 = (tmp_path / "Game/Levels/Ch/L01_helper.lean").read_text()
     assert "Statement helper" in level1
     assert "DefsAfter" not in level1
     level2 = (tmp_path / "Game/Levels/Ch/L02_t2.lean").read_text()
     assert "import Game.Generated.DefsAfter001" in level2
-    assert "Statement t2 : Toy.depval = Toy.depval" in level2
+    assert (
+        "Statement t2 : _root_.Toy.depval = _root_.Toy.depval" in level2
+    )
     assert "NewDefinition Toy.depval" in level2
     for path in written:
         text = path.read_text()
@@ -1285,7 +1585,7 @@ def test_independent_interleaved_worlds_regroup_safely(tmp_path):
     assert "Dependency B → A" in root
     stage = (tmp_path / "Game/Generated/DefsAfter001.lean").read_text()
     assert "import Game.Levels.B.L01_b1" in stage
-    assert "def dv : True :=\n  b1" in stage
+    assert "def dv : True :=\n  _root_.Toy.b1" in stage
     level_a1 = (tmp_path / "Game/Levels/A/L01_a1.lean").read_text()
     assert "import Game.Levels.B.L01_b1" in level_a1
     assert "import Game.Generated.DefsAfter001" in level_a1
@@ -1511,3 +1811,557 @@ def test_unique_target_statement_across_generated_files(tmp_path):
     for text in joined.values():
         assert "axiom " not in text
         assert "sorry" not in text
+
+
+def _level(decl: LeanDecl, hint_md: str | None = None) -> Level:
+    node = _theorem_node("lem:t", 0)
+    node.lean_names = [decl.full_name]
+    return Level(
+        index=1,
+        world_id="W",
+        file_stem="L01_t",
+        title="t",
+        intro_md="",
+        hint_md=hint_md,
+        decl=decl,
+        node=node,
+    )
+
+
+def test_context_replay_registers_instance_before_attribute_disable():
+    inst = _decl(
+        keyword="instance", name="instX", full_name="instX",
+        signature=": C Nat", proof="⟨0⟩",
+        source_text="noncomputable\ninstance instX : C Nat := ⟨0⟩",
+    )
+    decl = _decl(
+        name="t", full_name="t", proof="by trivial",
+        instances=[inst],
+        context=(
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=0, end_line=0,
+                namespace="", scope=(), kind="instance",
+                source_text="noncomputable\ninstance instX : C Nat := ⟨0⟩",
+                exported=True, supported=True, targets=("instX",),
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=1, end_line=1,
+                namespace="", scope=(), kind="attribute",
+                source_text="attribute [-instance] instX",
+                exported=True, supported=True,
+                targets=("_root_.instX",), instance_action="disable",
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=2, end_line=2,
+                namespace="", scope=(), kind="attribute",
+                source_text="attribute [instance 80] instX",
+                exported=True, supported=True,
+                targets=("_root_.instX",), instance_action="enable",
+                priority=80,
+            ),
+        ),
+    )
+    assert _context_lines(decl, {}) == ([], [
+        "attribute [local instance] _root_.instX",
+        "attribute [-instance] _root_.instX",
+        "attribute [local instance 80] _root_.instX",
+    ])
+
+
+def test_context_replay_emits_expression_notation_verbatim():
+    decl = _decl(
+        name="t", full_name="t", proof="by trivial",
+        notations=[
+            LeanNotation(
+                module="M", line=1, namespace="Cyclo",
+                pattern='"K"', target="", arguments=(),
+                expression="CyclotomicField 3 ℚ",
+            ),
+        ],
+        context=(
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=1, end_line=1,
+                namespace="Cyclo", scope=(), kind="notation3",
+                source_text='local notation3 "K" => CyclotomicField 3 ℚ',
+                exported=False, supported=True,
+            ),
+        ),
+    )
+    assert _context_lines(decl, {}) == ([], [
+        'local notation "K" => CyclotomicField 3 ℚ'
+    ])
+
+
+def test_context_dependency_on_level_theorem_is_staged_after_it():
+    """A context command's dependency (here an attribute target) that is a
+    blueprint theorem must be staged *after* that level, never copied early
+    into the preamble."""
+    helper = _theorem_node("lem:helper_lemma", 1)
+    blueprint = Blueprint(
+        nodes=[
+            _def_node("def:b", ["Toy.B"], 0),
+            helper,
+            _theorem_node("lem:t", 2, uses=["def:b"]),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "helper_lemma": _decl(
+            name="helper_lemma", full_name="helper_lemma",
+            proof="by trivial",
+        ),
+        "Toy.B": _decl(
+            keyword="def", name="B", full_name="Toy.B", namespace="Toy",
+            source_text="def B : Nat :=\n  1",
+            context=(
+                LeanContextCommand(
+                    module="M", source_path="M.lean", line=0, end_line=0,
+                    namespace="", scope=(), kind="attribute",
+                    source_text="attribute [instance] helper_lemma",
+                    exported=True, supported=True,
+                    targets=("_root_.helper_lemma",), instance_action="enable",
+                ),
+            ),
+        ),
+        "t": _decl(name="t", full_name="t", proof="by exact trivial"),
+    }
+
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+
+    assert [stage.index for stage in game.stages] == [0, 1]
+    assert [d.full_name for d, _ in game.stages[0].definitions] == []
+    assert [d.full_name for d, _ in game.stages[1].definitions] == ["Toy.B"]
+    assert game.stages[1].level.file_stem == "L01_helper_lemma"
+
+
+def test_context_replay_repeats_identical_events_verbatim():
+    """Every supported context event is replayed in order: a disable between
+    two identical enables must not dedup the second enable, and repeated
+    variable explicitness toggles are all kept."""
+    decl = _decl(
+        name="t", full_name="t", proof="by trivial",
+        context=(
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=0, end_line=0,
+                namespace="", scope=(), kind="attribute",
+                source_text="attribute [instance] instX",
+                exported=True, supported=True,
+                targets=("_root_.instX",), instance_action="enable",
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=1, end_line=1,
+                namespace="", scope=(), kind="attribute",
+                source_text="attribute [-instance] instX",
+                exported=True, supported=True,
+                targets=("_root_.instX",), instance_action="disable",
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=2, end_line=2,
+                namespace="", scope=(), kind="attribute",
+                source_text="attribute [instance] instX",
+                exported=True, supported=True,
+                targets=("_root_.instX",), instance_action="enable",
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=3, end_line=3,
+                namespace="", scope=(), kind="variable",
+                source_text="variable (K : Type*)",
+                exported=False, supported=True,
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=4, end_line=4,
+                namespace="", scope=(), kind="variable",
+                source_text="variable {K : Type*}",
+                exported=False, supported=True,
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=5, end_line=5,
+                namespace="", scope=(), kind="variable",
+                source_text="variable (K : Type*)",
+                exported=False, supported=True,
+            ),
+        ),
+    )
+    assert _context_lines(decl, {}) == ([], [
+        "attribute [local instance] _root_.instX",
+        "attribute [-instance] _root_.instX",
+        "attribute [local instance] _root_.instX",
+        "variable (K : Type*)",
+        "variable {K : Type*}",
+        "variable (K : Type*)",
+    ])
+
+
+def test_context_replay_registers_instance_at_command_position():
+    """A `noncomputable` modifier line before `instance` must not break the
+    link between the instance command and its declaration: registration is
+    emitted at the command's position, before the later disable."""
+    inst = _decl(
+        keyword="instance", name="instX", full_name="instX",
+        signature=": C Nat", proof="{ tag := 0 }",
+        source_text="noncomputable\ninstance instX : C Nat where\n  tag := 0",
+        modifiers=("noncomputable",), line=0,
+    )
+    decl = _decl(
+        name="t", full_name="t", proof="by trivial",
+        instances=[inst],
+        context=(
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=0, end_line=2,
+                namespace="", scope=(), kind="instance",
+                source_text="noncomputable\ninstance instX : C Nat where\n  tag := 0",
+                exported=True, supported=True, targets=("instX",),
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=3, end_line=3,
+                namespace="", scope=(), kind="attribute",
+                source_text="attribute [-instance] instX",
+                exported=True, supported=True,
+                targets=("_root_.instX",), instance_action="disable",
+            ),
+        ),
+    )
+    assert _context_lines(decl, {}) == ([], [
+        "attribute [local instance] _root_.instX",
+        "attribute [-instance] _root_.instX",
+    ])
+
+
+def test_obtain_pattern_binder_typed_by_helper_signature():
+    """`obtain ⟨S, -⟩ := exists_Solution_of_Solution' S'` types `S` from the
+    existential clause of the (prime-named) helper lemma — and a chained
+    `S.exists_minimal` is resolved through that type."""
+    decls = {
+        "Solution'": _decl(
+            keyword="def", name="Solution'", full_name="Solution'"
+        ),
+        "exists_Solution_of_Solution'": _decl(
+            name="exists_Solution_of_Solution'",
+            full_name="exists_Solution_of_Solution'",
+            signature="(S' : Solution') (hS' : 0 < S'.multiplicity) : "
+            "∃ (S₁ : Solution'), S₁.multiplicity = S'.multiplicity",
+        ),
+        "Solution'.exists_minimal": _decl(
+            name="exists_minimal", full_name="Solution'.exists_minimal",
+            namespace="Solution'",
+            signature="(S : Solution') : ∃ (Smin : Solution'), True",
+        ),
+    }
+    decl = _decl(name="t", full_name="t")
+    text = (
+        "obtain ⟨S, -⟩ := exists_Solution_of_Solution' S'\n"
+        "obtain ⟨Smin, hSmin⟩ := S.exists_minimal"
+    )
+    types = _obtain_binder_types(text, decl, decls, _binder_types(text))
+    assert types["S"] == "Solution'"
+    assert types["Smin"] == "Solution'"
+    assert "hSmin" not in types
+
+
+def test_obtain_nested_existential_does_not_invent_types():
+    """`∃ (a : A), P a ∧ ∃ (b : B), Q b` has one direct witness: a later
+    pattern leaf must not pick up the nested `B`."""
+    decls = {
+        "A": _decl(keyword="def", name="A", full_name="A"),
+        "B": _decl(keyword="def", name="B", full_name="B"),
+        "nested_exists": _decl(
+            name="nested_exists", full_name="nested_exists",
+            signature=": ∃ (a : A), P a ∧ ∃ (b : B), Q b",
+        ),
+    }
+    decl = _decl(name="t", full_name="t")
+    types = _obtain_binder_types(
+        "obtain ⟨x, y⟩ := nested_exists", decl, decls, {}
+    )
+    assert types["x"] == "A"
+    assert "y" not in types
+
+
+def test_obtain_binder_type_resolves_in_helper_namespace():
+    """The existential binder type `Bar` written in `Foo`'s source context
+    means `Foo.Bar`, never the caller's `Baz.Bar`."""
+    decls = {
+        "Foo.Bar": _decl(
+            keyword="def", name="Bar", full_name="Foo.Bar", namespace="Foo"
+        ),
+        "Baz.Bar": _decl(
+            keyword="def", name="Bar", full_name="Baz.Bar", namespace="Baz"
+        ),
+        "Foo.mk_pair": _decl(
+            name="mk_pair", full_name="Foo.mk_pair", namespace="Foo",
+            signature=": ∃ (b : Bar), P b",
+        ),
+    }
+    caller = _decl(name="t", full_name="Baz.t", namespace="Baz")
+    types = _obtain_binder_types(
+        "rcases Foo.mk_pair with ⟨b, h⟩", caller, decls, {}
+    )
+    assert types["b"] == "Foo.Bar"
+
+
+def test_obtain_later_binder_shadows_earlier():
+    decls = {
+        "A": _decl(keyword="def", name="A", full_name="A"),
+        "B": _decl(keyword="def", name="B", full_name="B"),
+        "ex_a": _decl(name="ex_a", full_name="ex_a", signature=": ∃ (x : A), P x"),
+        "ex_b": _decl(name="ex_b", full_name="ex_b", signature=": ∃ (x : B), Q x"),
+    }
+    decl = _decl(name="t", full_name="t")
+    types = _obtain_binder_types(
+        "obtain ⟨x, -⟩ := ex_a\nobtain ⟨x, -⟩ := ex_b", decl, decls, {}
+    )
+    assert types["x"] == "B"
+
+
+def test_qualify_project_refs_roots_project_names():
+    helper = _decl(
+        keyword="def", name="helper", full_name="Foo.helper", namespace="Foo"
+    )
+    decl = _decl(
+        keyword="def", name="t", full_name="Foo.t", namespace="Foo",
+        source_text="def t : Nat := helper",
+    )
+    decls = {"Foo.helper": helper, "Foo.t": decl}
+    assert (
+        _qualify_project_refs(decl.source_text, set(), decl, decls)
+        == "def t : Nat := _root_.Foo.helper"
+    )
+
+
+def test_qualify_project_refs_keeps_bound_names_strings_and_comments():
+    helper = _decl(
+        keyword="def", name="helper", full_name="Foo.helper", namespace="Foo"
+    )
+    decl = _decl(
+        keyword="def", name="t", full_name="Foo.t", namespace="Foo",
+        source_text="def t : Nat := 0",
+    )
+    decls = {"Foo.helper": helper, "Foo.t": decl}
+    text = (
+        'def t (helper : Nat) : Nat := -- helper stays a variable\n'
+        '  helper + 0  /- helper -/\n'
+        '  where_lt "helper"'
+    )
+    assert _qualify_project_refs(text, {"helper"}, decl, decls) == text
+
+
+def test_qualify_project_refs_detects_ambiguity():
+    decls = {
+        "N1.x": _decl(
+            keyword="def", name="x", full_name="N1.x", namespace="N1"
+        ),
+        "N2.x": _decl(
+            keyword="def", name="x", full_name="N2.x", namespace="N2"
+        ),
+    }
+    decl = _decl(name="t", full_name="t", opens=["open N1", "open N2"])
+    with pytest.raises(GenerationError, match="ambiguous"):
+        _qualify_project_refs("def t : Nat := x", set(), decl, decls)
+
+
+def test_source_refs_root_open_is_not_shadowed_by_relative_namespace():
+    decls = {
+        "Ks.k": _decl(
+            keyword="def", name="k", full_name="Ks.k", namespace="Ks"
+        ),
+        "Outer.Ks.k": _decl(
+            keyword="def", name="k", full_name="Outer.Ks.k",
+            namespace="Outer.Ks",
+        ),
+        "Outer.t": _decl(
+            keyword="def", name="t", full_name="Outer.t", namespace="Outer",
+            source_text="def t : Nat := k",
+            opens=["open _root_.Ks"],
+        ),
+    }
+    refs = _source_refs(decls["Outer.t"], decls)
+    assert [r.full_name for r in refs] == ["Ks.k"]
+
+
+def test_source_refs_open_matching_two_namespaces_is_ambiguous():
+    """`open Ks` inside `Outer` may denote both `Outer.Ks` and root `Ks`;
+    when both provide `k` the reference is ambiguous and must fail."""
+    decls = {
+        "Ks.k": _decl(
+            keyword="def", name="k", full_name="Ks.k", namespace="Ks"
+        ),
+        "Outer.Ks.k": _decl(
+            keyword="def", name="k", full_name="Outer.Ks.k",
+            namespace="Outer.Ks",
+        ),
+        "Outer.t": _decl(
+            keyword="def", name="t", full_name="Outer.t", namespace="Outer",
+            source_text="def t : Nat := k",
+            opens=["open Ks"],
+        ),
+    }
+    with pytest.raises(GenerationError, match="ambiguous"):
+        _source_refs(decls["Outer.t"], decls)
+
+
+def test_source_refs_follow_extends_projection_chain():
+    decls = {
+        "Base": _decl(
+            keyword="structure", name="Base", full_name="Base",
+            source_text="structure Base where\n  (a : Nat)",
+            signature="where\n  (a : Nat)",
+        ),
+        "Base.field": _decl(
+            keyword="theorem", name="Base.field", full_name="Base.field",
+            namespace="Base",
+            source_text="theorem field (b : Base) : Nat :=\n  b.a",
+            signature="(b : Base) : Nat",
+        ),
+        "Child": _decl(
+            keyword="structure", name="Child", full_name="Child",
+            source_text="structure Child extends Base where\n  (h : Nat)",
+            signature="extends Base where\n  (h : Nat)",
+        ),
+        "use": _decl(
+            keyword="def", name="use", full_name="use",
+            source_text="def use (c : Child) : Nat :=\n  c.toBase.field",
+            signature="(c : Child) : Nat",
+        ),
+    }
+    refs = _source_refs(decls["use"], decls)
+    names = [r.full_name for r in refs]
+    assert "Base.field" in names
+
+
+def test_qualify_project_refs_never_rewrites_header_name():
+    decls = {
+        "Foo.pair": _decl(
+            keyword="def", name="pair", full_name="Foo.pair", namespace="Foo"
+        ),
+    }
+    decl = _decl(
+        keyword="def", name="pair.probe", full_name="pair.probe",
+        source_text="def pair.probe : Nat := pair",
+        opens=["open Foo"],
+    )
+    decls["pair.probe"] = decl
+    assert _qualify_project_refs(
+        decl.source_text, set(), decl, decls
+    ) == "def pair.probe : Nat := _root_.Foo.pair"
+
+
+def test_qualify_project_refs_keeps_compound_receiver_suffix():
+    decls = {
+        "adjoin": _decl(keyword="def", name="adjoin", full_name="adjoin"),
+    }
+    decl = _decl(name="t", full_name="t", source_text="def t : Nat := 0")
+    decls["t"] = decl
+    text = "def t (f : Nat → Nat) (x : Nat) : Nat := (f x).adjoin + x.adjoin"
+    assert _qualify_project_refs(text, {"f", "x"}, decl, decls) == text
+
+
+def test_qualify_project_refs_keeps_char_literals_and_nested_comments():
+    decls = {"c": _decl(keyword="def", name="c", full_name="c")}
+    decl = _decl(name="t", full_name="t", source_text="def t : Nat := 0")
+    decls["t"] = decl
+    text = (
+        "def t : Char × Nat := ('c', 0) /- outer /- c -/ still comment -/"
+    )
+    assert _qualify_project_refs(text, set(), decl, decls) == text
+
+
+def test_qualify_project_refs_qualifies_free_constant_projection():
+    decls = {"hζ": _decl(keyword="def", name="hζ", full_name="hζ")}
+    decl = _decl(name="t", full_name="t", source_text="def t : Nat := 0")
+    decls["t"] = decl
+    assert (
+        _qualify_project_refs("def t : Nat := hζ.toNat", set(), decl, decls)
+        == "def t : Nat := _root_.hζ.toNat"
+    )
+
+
+def test_context_variable_command_uses_its_own_variable_scope():
+    decl = _decl(
+        name="t", full_name="t",
+        context=(
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=0, end_line=0,
+                namespace="", scope=(), kind="variable",
+                source_text="variable (K : Type*)",
+                exported=False, supported=True,
+                variables=("variable (K : Type*)",),
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=1, end_line=1,
+                namespace="", scope=(), kind="variable",
+                source_text="variable (x : K)",
+                exported=False, supported=True,
+                variables=("variable (K : Type*)", "variable (x : K)"),
+            ),
+        ),
+    )
+    decls = {
+        "K": _decl(keyword="def", name="K", full_name="K"),
+        "t": decl,
+    }
+    assert _context_lines(decl, decls) == ([], [
+        "variable (K : Type*)",
+        "variable (x : K)",
+    ])
+
+
+def test_context_variable_resolution_uses_command_opens_not_later_ones():
+    decl = _decl(
+        name="t", full_name="t",
+        opens=["open Foo", "open Bar"],
+        context=(
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=0, end_line=0,
+                namespace="", scope=(), kind="open",
+                source_text="open Foo",
+                exported=False, supported=True,
+                opens=("open Foo",),
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=1, end_line=1,
+                namespace="", scope=(), kind="variable",
+                source_text="variable (v : x)",
+                exported=False, supported=True,
+                variables=("variable (v : x)",),
+                opens=("open Foo",),
+            ),
+            LeanContextCommand(
+                module="M", source_path="M.lean", line=2, end_line=2,
+                namespace="", scope=(), kind="open",
+                source_text="open Bar",
+                exported=False, supported=True,
+                opens=("open Foo", "open Bar"),
+            ),
+        ),
+    )
+    decls = {
+        "Foo.x": _decl(keyword="def", name="x", full_name="Foo.x", namespace="Foo"),
+        "Bar.x": _decl(keyword="def", name="x", full_name="Bar.x", namespace="Bar"),
+        "t": decl,
+    }
+    _root_lines, lines = _context_lines(decl, decls)
+    assert "variable (v : _root_.Foo.x)" in lines
+
+
+def test_noncomputable_section_wraps_generated_definitions(tmp_path):
+    blueprint = Blueprint(
+        nodes=[_def_node("def:d", ["d"], 0)], chapters=["Ch"]
+    )
+    decls = {
+        "d": _decl(
+            keyword="def", name="d", full_name="d",
+            source_text="def d : Nat := 0",
+            noncomputable_section=True,
+        ),
+        "e": _decl(
+            keyword="def", name="e", full_name="e",
+            source_text="def e : Nat := 0",
+        ),
+    }
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    write_game(game, tmp_path)
+    defs = (tmp_path / "Game" / "Generated" / "Defs.lean").read_text()
+    assert "noncomputable section\n" in defs
+    block = defs.index("noncomputable section")
+    assert defs.index("def d : Nat := 0") > block
+    assert "noncomputable section\n\ndef e" not in defs

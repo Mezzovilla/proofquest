@@ -13,10 +13,12 @@ from .game_model import (
     DefsStage,
     Game,
     LeanDecl,
+    LeanNotation,
     Level,
     World,
 )
 from .latex_to_md import latex_to_markdown, lean_interp_string, lean_string
+from .lean_parser import _canonical_open, _masked_source, _open_ident_tokens
 
 _TACTIC_DOCS = {
     "apply": "`apply t` matches the goal against the conclusion of `t` and creates goals for its hypotheses.",
@@ -117,8 +119,9 @@ _TERM_KEYWORDS = frozenset(
 # Matches a (possibly dotted/qualified) Lean identifier, e.g. `le_max_left`,
 # `Nat.succ_pos` or `mul_inv_cancel₀` (Lean identifiers may end in subscript
 # digits or primes).
-_IDENT_PART = r"[A-Za-z_][A-Za-z0-9_'₀₁₂₃₄₅₆₇₈₉]*"
+_IDENT_PART = r"[^\W\d][\w'!?]*"
 _IDENT_RE = re.compile(_IDENT_PART + r"(?:\." + _IDENT_PART + r")*")
+_UNAME = r"[^\W\d][\w']*"
 
 # Generalized field notation / anonymous-constructor-style accessors, e.g.
 # `h.mp`, `foo.symm`, `bar.1`: the *last* component is not part of the
@@ -147,14 +150,14 @@ def _strip_accessor_suffix(name: str) -> str:
 # `(a + b)`, never match).
 _BINDER_GROUP_RE = re.compile(r"[(\{\[⦃]\s*([^():{}\[\]⦃⦄]+?)\s*:")
 
-_HAVE_LET_SET_RE = re.compile(r"\b(?:have|let|set|by_contra|by_cases|generalize)\s+([A-Za-z_][A-Za-z0-9_']*)")
+_HAVE_LET_SET_RE = re.compile(r"\b(?:have|let|set|by_contra|by_cases|generalize)\s+(" + _UNAME + r")")
 _INTRO_RE = re.compile(r"\b(?:intro|intros|rintro)\s+([^\n]*)")
 _OBTAIN_RE = re.compile(r"\bobtain\s+([^\n]*?)\s*:=")
 _RCASES_WITH_RE = re.compile(r"\brcases\b[^\n]*?\bwith\s+([^\n]*)")
 _FUN_RE = re.compile(r"\bfun\s+([^\n]*?)=>")
 _FORALL_EXISTS_RE = re.compile(r"[∀∃]\s*([^,]*),")
 _CHOOSE_RE = re.compile(r"\bchoose\s+([^\n]*?)\busing\b")
-_SET_WITH_RE = re.compile(r"\bwith\s+([A-Za-z_][A-Za-z0-9_']*)")
+_SET_WITH_RE = re.compile(r"\bwith\s+(" + _UNAME + r")")
 
 
 def _strip_lean_comments(text: str) -> str:
@@ -178,7 +181,7 @@ def _binder_names(text: str) -> set[str]:
     names: set[str] = set()
     for match in _BINDER_GROUP_RE.finditer(text):
         for token in match.group(1).split():
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_']*", token):
+            if re.fullmatch(_UNAME, token):
                 names.add(token)
     return names
 
@@ -195,13 +198,13 @@ def _proof_bound_names(proof: str) -> set[str]:
     names.update(match.group(1) for match in _SET_WITH_RE.finditer(proof))
     for regex in (_INTRO_RE, _OBTAIN_RE, _RCASES_WITH_RE, _FUN_RE, _CHOOSE_RE):
         for match in regex.finditer(proof):
-            names.update(re.findall(r"[A-Za-z_][A-Za-z0-9_']*", match.group(1)))
+            names.update(re.findall(_UNAME, match.group(1)))
     for match in _FORALL_EXISTS_RE.finditer(proof):
         segment = match.group(1)
         colon = segment.find(":")
         names.update(
             re.findall(
-                r"[A-Za-z_][A-Za-z0-9_']*",
+                _UNAME,
                 segment[:colon] if colon >= 0 else segment,
             )
         )
@@ -287,18 +290,148 @@ def _theorem_refs_in_proof(proof: str, bound_names: set[str]) -> list[str]:
     return refs
 
 
-def _qualified_candidates(name: str, decl: LeanDecl) -> list[str]:
-    """Ways ``name`` (as literally written in ``decl``'s proof) might resolve:
-    as-is, qualified by ``decl``'s own namespace, or by one of its ``open``s.
-    """
-    candidates = [name]
-    if decl.namespace:
-        candidates.append(f"{decl.namespace}.{name}")
-    for open_stmt in decl.opens:
-        namespace = open_stmt.removeprefix("open ").strip()
+def _context_namespace(decl: LeanDecl) -> str:
+    return (
+        decl.context_namespace
+        if decl.context_namespace is not None
+        else decl.namespace
+    )
+
+
+def _open_namespace_names(open_stmt: str, namespace: str) -> list[str]:
+    names: list[str] = []
+    scoped = False
+    for token in open_stmt.split()[1:]:
+        if token == "scoped":
+            scoped = True
+            continue
+        if token in ("noncomputable", "private"):
+            continue
+        if token.startswith("(") or token in ("hiding", "renaming", "in"):
+            break
+        if not re.fullmatch(_IDENT_PART + r"(?:\." + _IDENT_PART + r")*", token):
+            break
+        if scoped:
+            continue
+        if token.startswith("_root_."):
+            token = token.removeprefix("_root_.")
+            if token not in names:
+                names.append(token)
+            continue
         if namespace:
-            candidates.append(f"{namespace}.{name}")
-    return candidates
+            parts = namespace.split(".")
+            for i in range(len(parts), 0, -1):
+                candidate = ".".join(parts[:i]) + "." + token
+                if candidate not in names:
+                    names.append(candidate)
+        if token not in names:
+            names.append(token)
+    return names
+
+
+def _decl_open_entries(decl: LeanDecl):
+    commands = [
+        command
+        for command in decl.context
+        if command.kind == "open" and command.supported
+    ]
+    return commands if commands else list(decl.opens)
+
+
+def _elaboration_namespace(decl: LeanDecl) -> str:
+    """Namespace Lean elaborates the declaration body in: the declaration
+    name's own prefix (``def Solution'.multiplicity`` resolves names via
+    ``Solution'`` even when written at file root, ahead of the enclosing
+    namespace)."""
+    return decl.full_name.rpartition(".")[0]
+
+
+def _opened_namespaces(
+    opens,
+    namespace: str,
+    known: set[str],
+) -> list[str]:
+    opened: list[str] = []
+    for entry in opens:
+        if isinstance(entry, str):
+            open_text, open_ns = entry, namespace
+        else:
+            open_text, open_ns = entry.source_text, entry.namespace
+        tokens, scoped, _exotic = _open_ident_tokens(open_text)
+        if scoped:
+            continue
+        for token in tokens:
+            rooted = token.startswith("_root_.")
+            base = token.removeprefix("_root_.")
+            candidates: list[str] = []
+            if not rooted:
+                if open_ns:
+                    parts = open_ns.split(".")
+                    for i in range(len(parts), 0, -1):
+                        candidates.append(".".join(parts[:i]) + "." + base)
+                candidates.extend(f"{o}.{base}" for o in opened)
+            candidates.append(base)
+            hits = [c for c in candidates if c in known]
+            for ns in hits if hits else [base]:
+                if ns not in opened:
+                    opened.append(ns)
+    return opened
+
+
+def _known_namespaces(decls: dict[str, LeanDecl]) -> set[str]:
+    known: set[str] = set()
+    for decl in decls.values():
+        for dotted in (decl.namespace, decl.full_name):
+            parts = dotted.split(".")
+            for i in range(1, len(parts) + 1):
+                known.add(".".join(parts[:i]))
+    return known
+
+
+def _resolve_context_decl(
+    name: str,
+    namespace: str,
+    opens,
+    decls: dict[str, LeanDecl],
+    origin: str = "",
+    enclosing: str | None = None,
+) -> LeanDecl | None:
+    bare = name.removeprefix("_root_.")
+    if name.startswith("_root_."):
+        return decls.get(bare)
+    chains: list[str] = []
+    for scope in (namespace, enclosing):
+        if not scope:
+            continue
+        parts = scope.split(".")
+        for i in range(len(parts), 0, -1):
+            candidate = ".".join(parts[:i])
+            if candidate not in chains:
+                chains.append(candidate)
+    for scope in chains:
+        found = decls.get(scope + "." + bare)
+        if found is not None:
+            return found
+    found = decls.get(bare)
+    if found is not None:
+        return found
+    matches: dict[str, LeanDecl] = {}
+    for opened in _opened_namespaces(
+        opens,
+        enclosing if enclosing is not None else namespace,
+        _known_namespaces(decls),
+    ):
+        dep = decls.get(f"{opened}.{bare}")
+        if dep is not None:
+            matches[dep.full_name] = dep
+    if len(matches) > 1:
+        raise GenerationError(
+            f"ambiguous identifier {name} in {origin or '<context>'}: "
+            "possible project-local interpretations "
+            f"{', '.join(sorted(matches))}; qualify the name explicitly in "
+            "the source"
+        )
+    return next(iter(matches.values()), None)
 
 
 def _resolve_project_decl(
@@ -311,19 +444,22 @@ def _resolve_project_decl(
     not be re-declared with `NewTheorem` (and project-local definitions are
     handled separately, via the blueprint's `\\uses` graph).
     """
-    for candidate in _qualified_candidates(name, decl):
-        found = decls.get(candidate)
-        if found is not None:
-            return found
-    return None
+    return _resolve_context_decl(
+        name,
+        _elaboration_namespace(decl),
+        _decl_open_entries(decl),
+        decls,
+        origin=decl.full_name,
+        enclosing=_context_namespace(decl),
+    )
 
 
 _QUANTIFIER_TYPE_RE = re.compile(
-    r"([A-Za-z_][\w']*(?:\s+[A-Za-z_][\w']*)*)\s*:\s*([^\s:]+)"
+    r"(" + _UNAME + r"(?:\s+" + _UNAME + r")*)\s*:\s*([^\s:]+)"
 )
 
 _HAVE_LET_TYPE_RE = re.compile(
-    r"\b(?:have|let)\s+([A-Za-z_][\w']*)\s*:\s*(.+?)\s*:="
+    r"\b(?:have|let)\s+(" + _UNAME + r")\s*:\s*(.+?)\s*:="
 )
 
 
@@ -350,7 +486,7 @@ def _binder_types(text: str) -> dict[str, str]:
         if head is None:
             continue
         for name in match.group(1).split():
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_']*", name):
+            if re.fullmatch(_UNAME, name):
                 types[name] = head.group(0)
     for match in _FORALL_EXISTS_RE.finditer(text):
         for inner in _QUANTIFIER_TYPE_RE.finditer(match.group(1)):
@@ -366,11 +502,172 @@ def _binder_types(text: str) -> dict[str, str]:
     return types
 
 
+_OBTAIN_APP_RE = re.compile(
+    r"\bobtain\s+⟨([^⟩]*)⟩\s*:=\s*(" + _UNAME + r"(?:\." + _UNAME + r")*)"
+)
+_RCASES_APP_RE = re.compile(
+    r"\brcases\s+(" + _UNAME + r"(?:\." + _UNAME + r")*)"
+    r"[^⟨⟩\n]*?\bwith\s+⟨([^⟩]*)⟩"
+)
+
+def _exists_binder_types(signature: str) -> list[str | None]:
+    types: list[str | None] = []
+    depth = 0
+    colon = -1
+    for i, ch in enumerate(signature):
+        if ch in _OPEN:
+            depth += 1
+        elif ch in _CLOSE:
+            depth -= 1
+        elif ch == ":" and depth == 0:
+            colon = i
+            break
+    if colon < 0:
+        return types
+    rest = signature[colon + 1 :].lstrip()
+    while rest.startswith("∃"):
+        match = re.match(r"∃\s*([^,]*),", rest)
+        if match is None:
+            break
+        inner = match.group(1)
+        pos = 0
+        for typed in _QUANTIFIER_TYPE_RE.finditer(inner):
+            for token in inner[pos : typed.start()].split():
+                if re.fullmatch(_UNAME, token.strip("(),")):
+                    types.append(None)
+            pos = typed.end()
+            head = _IDENT_RE.match(typed.group(2).strip())
+            types.extend(
+                [head.group(0) if head is not None else None]
+                * len(typed.group(1).split())
+            )
+        for token in inner[pos:].split():
+            if re.fullmatch(_UNAME, token.strip("(), ")):
+                types.append(None)
+        rest = rest[match.end() :].lstrip()
+    return types
+
+
+def _obtain_binder_types(
+    text: str,
+    decl: LeanDecl,
+    decls: dict[str, LeanDecl],
+    known: dict[str, str],
+) -> dict[str, str]:
+    types = dict(known)
+    namespace = _elaboration_namespace(decl)
+    enclosing = _context_namespace(decl)
+    events: list[tuple[int, str, str]] = [
+        (m.start(), m.group(2), m.group(1))
+        for m in _OBTAIN_APP_RE.finditer(text)
+    ]
+    events += [
+        (m.start(), m.group(1), m.group(2))
+        for m in _RCASES_APP_RE.finditer(text)
+    ]
+    for _, head_name, pattern in sorted(events):
+        if "." in head_name and head_name.split(".", 1)[0] in types:
+            dep = _resolve_bound_dot_ref(head_name, decl, decls, types)
+        else:
+            dep = _resolve_context_decl(
+                head_name,
+                namespace,
+                _decl_open_entries(decl),
+                decls,
+                decl.full_name,
+                enclosing=enclosing,
+            )
+        if dep is None:
+            continue
+        binder_types = []
+        for raw_type in _exists_binder_types(dep.signature):
+            if raw_type is None:
+                binder_types.append(None)
+                continue
+            resolved = _resolve_context_decl(
+                raw_type,
+                _elaboration_namespace(dep),
+                _decl_open_entries(dep),
+                decls,
+                dep.full_name,
+                enclosing=_context_namespace(dep),
+            )
+            binder_types.append(
+                resolved.full_name if resolved is not None else None
+            )
+        leaves = [leaf.strip() for leaf in pattern.split(",")]
+        if any("⟨" in leaf or "(" in leaf for leaf in leaves):
+            continue
+        for i, leaf in enumerate(leaves):
+            if not leaf or leaf in ("-", "_"):
+                continue
+            name, _, annotation = leaf.partition(":")
+            name = name.strip()
+            if not re.fullmatch(_UNAME, name):
+                continue
+            if annotation.strip():
+                head = _IDENT_RE.match(annotation.strip())
+                if head is not None:
+                    types[name] = head.group(0)
+            elif i < len(binder_types) and binder_types[i] is not None:
+                types[name] = binder_types[i]
+    return types
+
+
+def _result_type_head(decl: LeanDecl) -> str | None:
+    depth = 0
+    signature = decl.signature
+    for index, char in enumerate(signature):
+        if char in _OPEN:
+            depth += 1
+        elif char in _CLOSE:
+            depth -= 1
+        elif char == ":" and depth == 0:
+            match = _IDENT_RE.match(signature[index + 1 :].lstrip())
+            return match.group(0) if match is not None else None
+    return None
+
+
+def _extends_projection_codomain(
+    type_decl: LeanDecl | None, segment: str, decls: dict[str, LeanDecl]
+) -> str | None:
+    if (
+        type_decl is None
+        or type_decl.keyword not in ("structure", "class")
+        or not segment.startswith("to")
+        or segment == "to"
+    ):
+        return None
+    match = re.search(
+        r"\bextends\b(.+?)\bwhere\b", type_decl.signature, re.DOTALL
+    )
+    if match is None:
+        return None
+    for parent in match.group(1).split(","):
+        head = _IDENT_RE.match(parent.lstrip())
+        if head is None:
+            continue
+        parent_name = head.group(0)
+        if f"to{parent_name.rpartition('.')[2]}" != segment:
+            continue
+        resolved = _resolve_context_decl(
+            parent_name,
+            _elaboration_namespace(type_decl),
+            _decl_open_entries(type_decl),
+            decls,
+        )
+        return resolved.full_name if resolved is not None else None
+    return None
+
+
 def _resolve_bound_dot_ref(
     name: str,
     decl: LeanDecl,
     decls: dict[str, LeanDecl],
     binder_types: dict[str, str],
+    namespace: str | None = None,
+    opens=None,
+    enclosing: str | None = None,
 ) -> LeanDecl | None:
     """Resolve ``S.rest`` where ``S`` is a bound variable, the way Lean does:
     by the *receiver type*. ``S : Solution`` makes ``S.y`` denote
@@ -388,6 +685,12 @@ def _resolve_bound_dot_ref(
     dependency: a :class:`GenerationError`, not a silent guess.
     """
     head, _, rest = name.partition(".")
+    if namespace is None:
+        namespace = _elaboration_namespace(decl)
+        if enclosing is None:
+            enclosing = _context_namespace(decl)
+    if opens is None:
+        opens = _decl_open_entries(decl)
     type_head = binder_types.get(head)
     if type_head is not None:
         tails = [
@@ -396,14 +699,67 @@ def _resolve_bound_dot_ref(
             if tail
         ]
         for tail in tails:
-            found = _resolve_project_decl(f"{type_head}.{tail}", decl, decls)
+            found = _resolve_context_decl(
+                f"{type_head}.{tail}",
+                namespace,
+                opens,
+                decls,
+                decl.full_name,
+                enclosing=enclosing,
+            )
             if found is not None:
                 return found
-        type_decl = _resolve_project_decl(type_head, decl, decls)
+        segments = rest.split(".")
+        if len(segments) > 1:
+            chain_dep: LeanDecl | None = None
+            chain_type = type_head
+            i = 0
+            while i < len(segments):
+                found = None
+                for j in range(len(segments), i, -1):
+                    found = _resolve_context_decl(
+                        f"{chain_type}." + ".".join(segments[i:j]),
+                        namespace,
+                        opens,
+                        decls,
+                        decl.full_name,
+                        enclosing=enclosing,
+                    )
+                    if found is not None:
+                        break
+                if found is not None:
+                    chain_dep = found
+                    if j == len(segments):
+                        return found
+                    chain_type = _result_type_head(found)
+                    if chain_type is None:
+                        return found
+                    i = j
+                    continue
+                type_decl = _resolve_context_decl(
+                    chain_type, namespace, opens, decls, decl.full_name,
+                    enclosing=enclosing,
+                )
+                codomain = _extends_projection_codomain(
+                    type_decl, segments[i], decls
+                )
+                if codomain is None:
+                    break
+                chain_type = codomain
+                i += 1
+            if chain_dep is not None:
+                return chain_dep
+        type_decl = _resolve_context_decl(
+            type_head, namespace, opens, decls, decl.full_name,
+            enclosing=enclosing,
+        )
         if type_decl is not None:
             for tail in dict.fromkeys((*tails, rest.split(".")[-1])):
                 if tail:
-                    found = _resolve_project_decl(tail, decl, decls)
+                    found = _resolve_context_decl(
+                        tail, namespace, opens, decls, decl.full_name,
+                        enclosing=enclosing,
+                    )
                     if found is not None:
                         return found
         elif type_head[0].isupper() or "." in type_head:
@@ -435,21 +791,79 @@ def _source_refs(decl: LeanDecl, decls: dict[str, LeanDecl]) -> list[LeanDecl]:
     """
     text = _strip_lean_comments(decl.source_text)
     text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+    text = re.sub(r"(?<![\w'.!?])'(?:\\[^'\\]+|[^'\\])'", "''", text)
     bound = _binder_names(decl.signature)
     bound |= _proof_bound_names(text)
     for var_line in decl.variables:
         bound |= _binder_names(var_line)
     text += "\n" + "\n".join(decl.variables)
-    binder_types = _binder_types(text)
+    binder_types = _obtain_binder_types(text, decl, decls, _binder_types(text))
     bound.add(decl.name)
     bound.add(decl.full_name)
     refs: list[LeanDecl] = []
     seen_refs: set[str] = set()
-    for notation in decl.notations:
-        dep = decls.get(notation.target)
-        if dep is not None and dep is not decl:
+
+    def add_dep(dep: LeanDecl | None) -> None:
+        if dep is not None and dep is not decl and dep.full_name not in seen_refs:
             refs.append(dep)
             seen_refs.add(dep.full_name)
+
+    for notation in decl.notations:
+        if notation.expression is None:
+            add_dep(decls.get(notation.target))
+            continue
+        notation_text = "\n".join(notation.variables)
+        notation_bound = _binder_names(notation_text)
+        notation_types = _binder_types(notation_text)
+        expr = re.sub(r'"(?:\\.|[^"\\])*"', '""', notation.expression)
+        for match in _IDENT_RE.finditer(expr):
+            raw = match.group(0)
+            name = _strip_accessor_suffix(raw)
+            if name.strip("_") == "":
+                continue
+            head = name.split(".", 1)[0]
+            if (
+                head in _KNOWN_TACTICS
+                or head in _TERM_KEYWORDS
+                or head in _LEAN_KEYWORDS
+            ):
+                continue
+            if head in notation_bound:
+                dep = (
+                    _resolve_bound_dot_ref(
+                        raw,
+                        decl,
+                        decls,
+                        notation_types,
+                        namespace=notation.namespace,
+                        opens=notation.opens,
+                    )
+                    if "." in raw
+                    else None
+                )
+            else:
+                dep = None
+                prefix = name
+                while prefix:
+                    dep = _resolve_context_decl(
+                        prefix,
+                        notation.namespace,
+                        notation.opens,
+                        decls,
+                        origin=(
+                            f"{decl.full_name} "
+                            f"(local notation {notation.pattern})"
+                        ),
+                    )
+                    if dep is not None or prefix == name.split(".")[0]:
+                        break
+                    prefix = prefix.rpartition(".")[0]
+            add_dep(dep)
+    for command in decl.context:
+        if command.kind == "attribute" and command.supported:
+            for target in command.targets:
+                if target.startswith("_root_."):
+                    add_dep(decls.get(target.removeprefix("_root_.")))
     seen: set[str] = set()
     for match in _IDENT_RE.finditer(text):
         raw = match.group(0)
@@ -469,7 +883,7 @@ def _source_refs(decl: LeanDecl, decls: dict[str, LeanDecl]) -> list[LeanDecl]:
                 else None
             )
         else:
-            dep = _resolve_project_decl(name.removeprefix("_root_."), decl, decls)
+            dep = _resolve_project_decl(name, decl, decls)
         if dep is not None and dep is not decl and dep.full_name not in seen_refs:
             refs.append(dep)
             seen_refs.add(dep.full_name)
@@ -500,13 +914,23 @@ def _project_open_targets(
     """Project-local namespaces opened by ``decl``'s ``open`` statements."""
     bad: list[str] = []
     for open_stmt in decl.opens:
+        scoped = False
+        exotic = False
+        idents: list[str] = []
         for token in open_stmt.split()[1:]:
             if token in ("scoped", "noncomputable", "private"):
+                scoped = scoped or token == "scoped"
                 continue
             if token.startswith("(") or token in ("hiding", "renaming", "in"):
+                exotic = True
                 break
             if not re.fullmatch(_IDENT_PART + r"(?:\." + _IDENT_PART + r")*", token):
+                exotic = True
                 break
+            idents.append(token)
+        if scoped or not exotic:
+            continue
+        for token in idents:
             parts = token.split(".")
             if (
                 any(
@@ -689,10 +1113,9 @@ def _is_declared_theorem(name: str, decl: LeanDecl, decls: dict[str, LeanDecl]) 
     GameServer's own `getConstInfo` check would reject, since that fails
     `lake build`.
     """
-    for candidate in _qualified_candidates(name, decl):
-        found = decls.get(candidate)
-        if found is not None:
-            return found.keyword in ("theorem", "lemma")
+    found = _resolve_project_decl(name, decl, decls)
+    if found is not None:
+        return found.keyword in ("theorem", "lemma")
     return _looks_like_theorem_name(name)
 
 
@@ -1436,6 +1859,8 @@ def build_game(
         toolchain=toolchain,
         stages=stages,
         world_dependencies=sorted(dependency_pairs),
+        project_scopes=frozenset(project_scopes),
+        decls=decls,
     )
 
 
@@ -1512,23 +1937,207 @@ def _strip_redundant_set(proof: str, signature: str) -> str:
     return body[i:].lstrip("\n")
 
 
-def _emit_source(decl: LeanDecl) -> str:
+_CHAR_LIT_RE = re.compile(r"'(?:\\[^'\\]+|[^'\\])'")
+
+
+def _code_mask(text: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    depth = 0
+    last_sig = ""
+    while i < n:
+        if depth > 0:
+            if text.startswith("/-", i):
+                depth += 1
+            elif text.startswith("-/", i):
+                depth -= 1
+            out.append("\n" if text[i] == "\n" else " ")
+            i += 1
+            continue
+        ch = text[i]
+        if ch == '"':
+            out.append(" ")
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    out.append("  ")
+                    i += 2
+                else:
+                    out.append("\n" if text[i] == "\n" else " ")
+                    i += 1
+            if i < n:
+                out.append(" ")
+                i += 1
+            last_sig = '"'
+        elif text.startswith("--", i):
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif text.startswith("/-", i):
+            depth += 1
+            out.append("  ")
+            i += 2
+        elif (
+            ch == "'"
+            and not (
+                last_sig.isalnum() or last_sig in "_'.!?"
+            )
+            and (literal := _CHAR_LIT_RE.match(text, i)) is not None
+        ):
+            out.extend(" " * (literal.end() - i))
+            i = literal.end()
+            last_sig = "'"
+        else:
+            out.append(ch)
+            if not ch.isspace():
+                last_sig = ch
+            i += 1
+    return "".join(out)
+
+
+_HEADER_NAME_RE = re.compile(
+    r"\s*(?:@[\s\S]*?\]\s*)?"
+    r"(?:(?:private|protected|noncomputable|partial|scoped|local)\s+)*"
+    r"(?:def|theorem|lemma|abbrev|instance|structure|class|opaque|example)\s+"
+)
+
+
+def _qualify_project_refs(
+    text: str,
+    bound: set[str],
+    decl: LeanDecl,
+    decls: dict[str, LeanDecl],
+    namespace: str | None = None,
+    opens=None,
+    enclosing: str | None = None,
+) -> str:
+    if not text or not decls:
+        return text
+    if namespace is None:
+        namespace = _elaboration_namespace(decl)
+        if enclosing is None:
+            enclosing = _context_namespace(decl)
+    if opens is None:
+        opens = _decl_open_entries(decl)
+    masked = _code_mask(text)
+    name_span: tuple[int, int] | None = None
+    header = _HEADER_NAME_RE.match(masked)
+    if header is not None:
+        name_match = _IDENT_RE.match(masked, header.end())
+        if name_match is not None:
+            name_span = name_match.span()
+    edits: list[tuple[int, int, str]] = []
+    for match in _IDENT_RE.finditer(masked):
+        raw = match.group(0)
+        head = raw.split(".", 1)[0]
+        if head in bound or raw.startswith("_root_."):
+            continue
+        if match.start() > 0 and masked[match.start() - 1] == ".":
+            continue
+        if name_span is not None and match.start() == name_span[0]:
+            continue
+        if head in _KNOWN_TACTICS or head in _TERM_KEYWORDS or head in _LEAN_KEYWORDS:
+            continue
+        dep = _resolve_context_decl(
+            raw, namespace, opens, decls, decl.full_name, enclosing=enclosing
+        )
+        if dep is None:
+            probe = raw.rpartition(".")[0]
+            while probe:
+                dep = _resolve_context_decl(
+                    probe, namespace, opens, decls, decl.full_name,
+                    enclosing=enclosing,
+                )
+                if dep is not None:
+                    break
+                probe = probe.rpartition(".")[0]
+            probe = probe or raw
+        else:
+            probe = raw
+        if dep is None or dep.full_name == decl.full_name:
+            continue
+        edits.append(
+            (
+                match.start(),
+                match.end(),
+                f"_root_.{dep.full_name}{raw[len(probe):]}",
+            )
+        )
+    for start, end, replacement in reversed(edits):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def _emit_source(decl: LeanDecl, decls: dict[str, LeanDecl]) -> str:
+    bound = _binder_names(decl.signature)
+    for var_line in decl.variables:
+        bound |= _binder_names(var_line)
+    if decl.proof is not None:
+        bound |= _proof_bound_names(decl.proof)
     if decl.keyword == "instance":
         mods = "".join(
             f"{m} " for m in decl.modifiers if m in ("noncomputable", "partial")
         )
-        return f"{mods}def {decl.name} {decl.signature} := {decl.proof}"
-    return decl.source_text
+        signature = _qualify_project_refs(decl.signature, bound, decl, decls)
+        proof = _qualify_project_refs(decl.proof or "", bound, decl, decls)
+        context_ns = _context_namespace(decl)
+        if context_ns and decl.full_name.startswith(context_ns + "."):
+            name = decl.full_name[len(context_ns) + 1 :]
+        elif context_ns:
+            name = f"_root_.{decl.full_name}"
+        else:
+            name = decl.full_name
+        return f"{mods}def {name} {signature} := {proof}"
+    return _qualify_project_refs(decl.source_text, bound, decl, decls)
 
 
-def _context_lines(decl: LeanDecl) -> list[str]:
+def _context_lines(
+    decl: LeanDecl, decls: dict[str, LeanDecl]
+) -> tuple[list[str], list[str]]:
+    """Replayable context commands, split into ``(root_lines, inner_lines)``.
+
+    ``inner_lines`` are emitted inside the declaration's ``namespace``
+    wrapper; ``root_lines`` are ``open`` commands that must be placed
+    outside it (before it) because their original position was the file
+    root or they were resolved to an absolute project scope — re-resolving
+    them inside the wrapper could silently pick a different namespace.
+    """
+    root_lines: list[str] = []
     lines: list[str] = []
+    seen_notations: set[LeanNotation] = set()
+    registered: set[str] = set()
+    context_ns = _context_namespace(decl)
+    project_scopes = _project_scopes(decls)
     for command in decl.context:
         if not command.supported:
             continue
-        if command.kind in ("open", "variable"):
-            lines.append(command.source_text)
-        elif command.kind == "notation":
+        if command.kind == "open":
+            canonical = _canonical_open(
+                command.source_text,
+                command.namespace,
+                context_ns,
+                project_scopes,
+            )
+            for emitted, _resolution, at_root in canonical or (
+                (command.source_text, command.source_text, False),
+            ):
+                (root_lines if at_root else lines).append(emitted)
+        elif command.kind == "variable":
+            bound: set[str] = set()
+            for var_line in command.variables:
+                bound |= _binder_names(var_line)
+            lines.append(
+                _qualify_project_refs(
+                    command.source_text,
+                    bound,
+                    decl,
+                    decls,
+                    namespace=command.namespace,
+                    opens=command.opens,
+                )
+            )
+        elif command.kind in ("notation", "notation3"):
             notation = next(
                 (
                     n
@@ -1537,32 +2146,100 @@ def _context_lines(decl: LeanDecl) -> list[str]:
                 ),
                 None,
             )
-            if notation is not None:
-                lines.append(
-                    f"local notation {notation.pattern} => "
-                    f"_root_.{notation.target} {' '.join(notation.arguments)}"
-                )
-    return lines
-
-
-def _context_section(decl: LeanDecl) -> list[str]:
-    inner: list[str] = []
-    for line in _context_lines(decl):
-        if line not in inner:
-            inner.append(line)
+            if notation is not None and notation not in seen_notations:
+                seen_notations.add(notation)
+                if notation.expression is not None:
+                    expression = _qualify_project_refs(
+                        notation.expression,
+                        _binder_names("\n".join(notation.variables)),
+                        decl,
+                        decls,
+                        namespace=notation.namespace,
+                        opens=notation.opens,
+                    )
+                    lines.append(
+                        f"local notation {notation.pattern} => {expression}"
+                    )
+                else:
+                    arguments = " ".join(notation.arguments)
+                    lines.append(
+                        f"local notation {notation.pattern} => "
+                        f"_root_.{notation.target}"
+                        + (f" {arguments}" if arguments else "")
+                    )
+        elif command.kind == "instance":
+            for inst in decl.instances:
+                if (
+                    inst.full_name in command.targets
+                    and inst.full_name not in registered
+                ):
+                    registered.add(inst.full_name)
+                    lines.append(
+                        f"attribute [local instance] _root_.{inst.full_name}"
+                    )
+        elif command.kind == "attribute":
+            priority = (
+                f" {command.priority}" if command.priority is not None else ""
+            )
+            for target in command.targets:
+                if command.instance_action == "disable":
+                    lines.append(f"attribute [-instance] {target}")
+                else:
+                    lines.append(f"attribute [local instance{priority}] {target}")
     for inst in decl.instances:
-        inner.append(f"attribute [local instance] _root_.{inst.full_name}")
-    return inner
+        if inst.full_name not in registered:
+            lines.append(f"attribute [local instance] _root_.{inst.full_name}")
+    return root_lines, lines
 
 
-def _statement_proof(level: Level) -> str:
+def _context_section(
+    decl: LeanDecl, decls: dict[str, LeanDecl]
+) -> tuple[list[str], list[str]]:
+    return _context_lines(decl, decls)
+
+
+def _decl_open_lines(decl: LeanDecl) -> tuple[list[str], list[str]]:
+    root: list[str] = []
+    inner: list[str] = []
+    for entry in decl.opens:
+        tokens = entry.split()
+        if any(token.startswith("_root_.") for token in tokens):
+            root.append(
+                " ".join(
+                    token.removeprefix("_root_.") for token in tokens
+                )
+            )
+        else:
+            inner.append(entry)
+    return root, inner
+
+
+def _context_scaffolds(decl: LeanDecl, project_scopes: set[str]) -> list[str]:
+    namespace = _context_namespace(decl)
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for opened in _opened_namespaces(
+        _decl_open_entries(decl), namespace, project_scopes
+    ):
+        if opened in project_scopes and opened not in seen:
+            seen.add(opened)
+            blocks.append(f"namespace {opened}\nend {opened}")
+    return blocks
+
+
+def _statement_proof(level: Level, decls: dict[str, LeanDecl]) -> str:
     """Proof block of the Statement: sample solution with the LaTeX hint."""
+    decl = level.decl
     lines: list[str] = []
     if level.hint_md:
         lines.append(f'Hint "{lean_interp_string(level.hint_md)}"')
-    proof = (level.decl.proof or "").strip()
+    proof = (decl.proof or "").strip()
+    bound = _binder_names(decl.signature) | _proof_bound_names(proof)
+    for var_line in decl.variables:
+        bound |= _binder_names(var_line)
     if proof.startswith("by"):
-        body = _strip_redundant_set(proof[2:].strip("\n"), level.decl.signature)
+        body = _strip_redundant_set(proof[2:].strip("\n"), decl.signature)
+        body = _qualify_project_refs(body, bound, decl, decls)
         raw = [line for line in body.splitlines() if line.strip()]
         indent = min(len(line) - len(line.lstrip()) for line in raw) if raw else 0
         lines.extend(line[indent:] for line in raw)
@@ -1594,31 +2271,21 @@ def _render_level(
     ]
 
     world_title = next(w.title for w in game.worlds if w.world_id == level.world_id)
-    statement = f"Statement {decl.name} {decl.signature} := {_statement_proof(level)}"
+    context_ns = _context_namespace(decl)
+    mismatched = decl.namespace != context_ns
+    statement_name = decl.name if not mismatched else decl.full_name
+    bound = _binder_names(decl.signature)
+    for var_line in decl.variables:
+        bound |= _binder_names(var_line)
+    signature = _qualify_project_refs(decl.signature, bound, decl, game.decls)
+    statement = (
+        f"Statement {statement_name} {signature} := "
+        f"{_statement_proof(level, game.decls)}"
+    )
     doc = (
         f"/-- {_doc_comment(level.intro_md)} -/\n"
         f'TheoremDoc {decl.full_name} as "{decl.name}" in "{lean_string(world_title)}"'
     )
-    inner = _context_section(decl)
-    if inner:
-        context = "\n".join(inner) + "\n\n"
-        body = f"{context}{doc}\n\n{statement}"
-        if decl.namespace:
-            body = f"namespace {decl.namespace}\n\n{body}\n\nend {decl.namespace}"
-        parts.append(f"section\n{body}\n\nend")
-    else:
-        var_block = "\n".join(decl.variables) + "\n\n" if decl.variables else ""
-        open_block = "\n".join(decl.opens) + "\n\n" if decl.opens else ""
-        body = f"{var_block}{open_block}{doc}\n\n{statement}"
-        if decl.namespace:
-            parts.append(
-                f"namespace {decl.namespace}\n\n{body}\n\nend {decl.namespace}"
-            )
-        else:
-            parts.append(body)
-
-    parts.append('Conclusion "Level completed! 🎉"')
-
     footer = []
     if level.new_tactics:
         footer.append("NewTactic " + " ".join(_tactic_ident(t) for t in level.new_tactics))
@@ -1626,8 +2293,59 @@ def _render_level(
         footer.append("NewDefinition " + " ".join(d.full_name for d in level.new_definitions))
     if level.new_theorems:
         footer.append("NewTheorem " + " ".join(level.new_theorems))
-    if footer:
-        parts.append("\n".join(footer))
+    footer_block = "\n\n" + "\n".join(footer) if footer else ""
+
+    parts.extend(_context_scaffolds(decl, game.project_scopes))
+    root_lines, inner = _context_section(decl, game.decls)
+    if mismatched and context_ns:
+        parts_ns = context_ns.split(".")
+        chain = [
+            f"open {'.'.join(parts_ns[:i])}"
+            for i in range(1, len(parts_ns) + 1)
+        ]
+        inner = chain + inner
+    if inner or root_lines:
+        context = "\n".join(inner) + "\n\n" if inner else ""
+        body = f"{context}{doc}\n\n{statement}{footer_block}"
+        if context_ns and not mismatched:
+            body = f"namespace {context_ns}\n\n{body}\n\nend {context_ns}"
+        root = "\n".join(root_lines) + "\n\n" if root_lines else ""
+        section = (
+            "noncomputable section"
+            if decl.noncomputable_section
+            else "section"
+        )
+        parts.append(f"{section}\n{root}{body}\n\nend")
+    else:
+        earlier: set[str] = set()
+        var_lines = []
+        for var_line in decl.variables:
+            bound_here = earlier | _binder_names(var_line)
+            var_lines.append(
+                _qualify_project_refs(var_line, bound_here, decl, game.decls)
+            )
+            earlier = bound_here
+        var_block = "\n".join(var_lines) + "\n\n" if var_lines else ""
+        open_root, open_inner = _decl_open_lines(decl)
+        open_block = "\n".join(open_inner) + "\n\n" if open_inner else ""
+        body = f"{var_block}{open_block}{doc}\n\n{statement}{footer_block}"
+        if context_ns and not mismatched:
+            body = f"namespace {context_ns}\n\n{body}\n\nend {context_ns}"
+        elif mismatched and context_ns:
+            parts_ns = context_ns.split(".")
+            chain = "\n".join(
+                f"open {'.'.join(parts_ns[:i])}"
+                for i in range(1, len(parts_ns) + 1)
+            )
+            body = f"{chain}\n\n{body}"
+        root = "\n".join(open_root) + "\n\n" if open_root else ""
+        if decl.noncomputable_section:
+            body = f"noncomputable section\n{root}{body}\n\nend"
+        else:
+            body = root + body
+        parts.append(body)
+
+    parts.append('Conclusion "Level completed! 🎉"')
     return "\n\n".join(parts) + "\n"
 
 
@@ -1719,43 +2437,60 @@ def _render_defs_stage(game: Game, stage: DefsStage) -> str:
         )
     import_lines.append("import GameServer.Commands")
     parts = ["\n".join(import_lines)]
-    # Collect the union of `open` statements needed by all definitions.
-    all_opens: list[str] = []
-    seen_opens: set[str] = set()
-    for decl, _ in stage.definitions:
-        for op in decl.opens:
-            if op not in seen_opens:
-                seen_opens.add(op)
-                all_opens.append(op)
-    if all_opens:
-        parts.append("section\n" + "\n".join(all_opens) + "\nend")
+    scaffold_seen: set[str] = set()
     for decl, node in stage.definitions:
         doc_md = (
             latex_to_markdown(node.statement_tex) if node else f"Definition `{decl.full_name}`."
         )
-        inner = _context_section(decl)
+        for scaffold in _context_scaffolds(decl, game.project_scopes):
+            if scaffold not in scaffold_seen:
+                scaffold_seen.add(scaffold)
+                parts.append(scaffold)
+        root_lines, inner = _context_section(decl, game.decls)
         doc = (
             f"/-- {_doc_comment(doc_md)} -/\n"
             f'DefinitionDoc {decl.full_name} as "{decl.name}"'
         )
-        source = _emit_source(decl)
-        if inner:
-            context = "\n".join(inner) + "\n\n"
+        source = _emit_source(decl, game.decls)
+        context_ns = _context_namespace(decl)
+        if inner or root_lines:
+            context = "\n".join(inner) + "\n\n" if inner else ""
             block = f"{context}{source}\n\n{doc}"
-            if decl.namespace:
+            if context_ns:
                 block = (
-                    f"namespace {decl.namespace}\n\n{block}\n\nend {decl.namespace}"
+                    f"namespace {context_ns}\n\n{block}\n\nend {context_ns}"
                 )
-            block = f"section\n{block}\n\nend"
-        else:
-            var_block = (
-                "\n".join(decl.variables) + "\n\n" if decl.variables else ""
+            root = "\n".join(root_lines) + "\n\n" if root_lines else ""
+            section = (
+                "noncomputable section"
+                if decl.noncomputable_section
+                else "section"
             )
-            block = f"{var_block}{source}\n\n{doc}"
-            if decl.namespace:
-                block = (
-                    f"namespace {decl.namespace}\n\n{block}\n\nend {decl.namespace}"
+            block = f"{section}\n{root}{block}\n\nend"
+        else:
+            earlier: set[str] = set()
+            var_lines = []
+            for var_line in decl.variables:
+                bound_here = earlier | _binder_names(var_line)
+                var_lines.append(
+                    _qualify_project_refs(
+                        var_line, bound_here, decl, game.decls
+                    )
                 )
+                earlier = bound_here
+            var_block = "\n".join(var_lines) + "\n\n" if var_lines else ""
+            open_root, open_inner = _decl_open_lines(decl)
+            open_block = "\n".join(open_inner) + "\n\n" if open_inner else ""
+            block = f"{var_block}{open_block}{source}\n\n{doc}"
+            if context_ns:
+                block = (
+                    f"namespace {context_ns}\n\n{block}\n\nend {context_ns}"
+                )
+            root = "\n".join(open_root) + "\n\n" if open_root else ""
+            if decl.noncomputable_section:
+                block = f"noncomputable section\n{root}{block}\n\nend"
+            else:
+                block = root + block
         parts.append(block)
     return "\n\n".join(parts) + "\n"
 
