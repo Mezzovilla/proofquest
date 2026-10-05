@@ -25,8 +25,14 @@ from pathlib import Path
 import pytest
 
 from proofquest.serve import (
+    _LEGACY_NODE_VERSION,
+    _LEGACY_VENDOR_PINS,
     ServeError,
+    _legacy_runtime,
     _npm_allow_git,
+    _pack_package_dir,
+    _provision_legacy_node,
+    _relay_entry,
     ensure_runtime,
     game_name,
     lean4game_ref,
@@ -471,3 +477,660 @@ def test_serve_refuses_unbuilt_game(tmp_path, monkeypatch):
     )
     with pytest.raises(ServeError, match="lake build"):
         serve(args)
+
+
+FAKE_NODE_LEGACY = """\
+import http.server
+import os
+import sys
+
+if "--version" in sys.argv:
+    print("VERSION_HERE")
+    sys.exit(0)
+port = int(os.environ.get("PORT", "3999"))
+http.server.ThreadingHTTPServer(
+    ("127.0.0.1", port), http.server.SimpleHTTPRequestHandler
+).serve_forever()
+"""
+
+FAKE_NPM_LEGACY = """\
+import os
+import sys
+
+args = sys.argv[1:]
+if args[:2] == ["run", "build_client"]:
+    os.makedirs("client/dist", exist_ok=True)
+    open("client/dist/index.html", "w").write("<html>legacy</html>")
+log = os.environ.get("PQ_NPM_LOG")
+if log:
+    with open(log, "a") as fh:
+        fh.write(" ".join(args) + "\\n")
+"""
+
+LEGACY_LOCK = {
+    "name": "lean4game",
+    "version": "4.7.0",
+    "lockfileVersion": 3,
+    "requires": True,
+    "packages": {
+        "": {
+            "name": "lean4game",
+            "version": "4.7.0",
+            "dependencies": {
+                "express": "^4.18.2",
+                "lean4-infoview": "https://gitpkg.now.sh/leanprover/vscode-lean4"
+                "/lean4-infoview?de0062c",
+                "lean4web": "github:hhu-adam/lean4web"
+                "#414d9e62638a392fca278761b4c61a1d2e138bc7",
+            },
+        },
+        "node_modules/express": {
+            "version": "4.18.2",
+            "resolved": "https://registry.npmjs.org/express/-/express-4.18.2.tgz",
+            "integrity": "sha512-EXPRESS",
+        },
+        "node_modules/lean4": {
+            "version": "0.0.119",
+            "resolved": "https://gitpkg.now.sh/leanprover/vscode-lean4"
+            "/vscode-lean4?8d0cc34dcfa00da8b4a48394ba1fb3a600e3f985",
+            "integrity": "sha512-OLD-lean4",
+        },
+        "node_modules/lean4-infoview": {
+            "version": "0.4.2",
+            "resolved": "https://gitpkg.now.sh/leanprover/vscode-lean4"
+            "/lean4-infoview?de0062c",
+            "integrity": "sha512-OLD-infoview",
+        },
+        "node_modules/lean4web": {
+            "version": "0.1.0",
+            "resolved": "git+ssh://git@github.com/hhu-adam/lean4web.git"
+            "#414d9e62638a392fca278761b4c61a1d2e138bc7",
+            "integrity": "sha512-OLD-lean4web",
+            "dependencies": {
+                "express": "^4.18.2",
+                "lean4": "https://gitpkg.now.sh/leanprover/vscode-lean4"
+                "/vscode-lean4?8d0cc34dcfa00da8b4a48394ba1fb3a600e3f985",
+            },
+        },
+    },
+}
+
+LEGACY_PACKAGE_JSON = {
+    "name": "lean4game",
+    "version": "4.7.0",
+    "private": True,
+    "scripts": {
+        "build_client": "vite build",
+        "build_server": "cd server && lake build",
+        "start": "node relay/index.mjs",
+    },
+    "dependencies": LEGACY_LOCK["packages"][""]["dependencies"],
+}
+
+
+def _tar_bytes(entries: dict, mode: str = "w:gz") -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode=mode) as tar:
+        for name, data in sorted(entries.items()):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o755 if name.endswith(("/node", "/npm")) else 0o644
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def make_legacy_lean4game(root: Path) -> Path:
+    source = root / "lean4game-legacy"
+    (source / "relay").mkdir(parents=True)
+    (source / "relay" / "index.mjs").write_text(
+        "import { WebSocketServer } from 'ws';\n"
+        "router.get('/import/status/:owner/:repo', importStatus)\n"
+        "router.get('/import/trigger/:owner/:repo', importTrigger)\n"
+        "  .listen(PORT, () => console.log(`Listening on ${PORT}`));\n"
+        "const wss = new WebSocketServer({ server })\n"
+    )
+    (source / "client" / "src").mkdir(parents=True)
+    (source / "client" / "src" / "main.ts").write_text("//\n")
+    (source / "package.json").write_text(json.dumps(LEGACY_PACKAGE_JSON))
+    (source / "package-lock.json").write_text(json.dumps(LEGACY_LOCK))
+    for name in ("index.html", "vite.config.ts", "tsconfig.json", "env.d.ts"):
+        (source / name).write_text(f"// {name}\n")
+    return source
+
+
+def _node_dist_payload() -> tuple:
+    import hashlib
+    import platform as _platform
+    import sys as _sys
+
+    osname = {"linux": "linux", "darwin": "darwin"}[_sys.platform]
+    arch = {"x86_64": "x64", "aarch64": "arm64", "arm64": "arm64"}[
+        _platform.machine().lower()
+    ]
+    dist = f"node-{_LEGACY_NODE_VERSION}-{osname}-{arch}"
+    payload = _tar_bytes(
+        {
+            f"{dist}/bin/node": (
+                "#!/usr/bin/env python3\n"
+                + FAKE_NODE_LEGACY.replace("VERSION_HERE", _LEGACY_NODE_VERSION)
+            ).encode(),
+            f"{dist}/bin/npm": (
+                "#!/usr/bin/env python3\n" + FAKE_NPM_LEGACY
+            ).encode(),
+        },
+        mode="w:xz",
+    )
+    sums = f"{hashlib.sha256(payload).hexdigest()}  {dist}.tar.xz\n".encode()
+    return dist, payload, sums
+
+
+def _vendor_payloads() -> dict:
+    payloads = {}
+    for pin in _LEGACY_VENDOR_PINS:
+        rootname = f"{pin.repo.split('/')[-1]}-{pin.sha}"
+        manifest = {"name": pin.package_name, "version": pin.version}
+        if pin.dep == "lean4web":
+            manifest["dependencies"] = {
+                "lean4": "https://gitpkg.now.sh/leanprover/vscode-lean4"
+                "/vscode-lean4?8d0cc34dcfa00da8b4a48394ba1fb3a600e3f985"
+            }
+        prefix = f"{rootname}/{pin.subdir}/" if pin.subdir else f"{rootname}/"
+        payloads[(pin.repo, pin.sha)] = _tar_bytes(
+            {
+                f"{prefix}package.json": json.dumps(manifest).encode(),
+                f"{prefix}src/index.ts": b"// source\n",
+                f"{prefix}LICENSE": b"MIT\n",
+            }
+        )
+    return payloads
+
+
+def _fake_urlopen_factory(node_payload=None, node_sums=b"", vendors=None):
+    vendors = vendors if vendors is not None else _vendor_payloads()
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("SHASUMS256.txt"):
+            return io.BytesIO(node_sums)
+        if url.endswith(".tar.xz"):
+            return io.BytesIO(node_payload)
+        for (repo, sha), payload in vendors.items():
+            if repo in url and sha in url:
+                return io.BytesIO(payload)
+        raise AssertionError(f"unexpected urlopen {url}")
+
+    return fake_urlopen
+
+
+def test_legacy_prepare(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    assert _legacy_runtime(source)
+
+    npm_log = tmp_path / "npm.log"
+    monkeypatch.setenv("PQ_NPM_LOG", str(npm_log))
+    root = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+
+    assert root.name.endswith("-compat1")
+    assert (root / "relay" / "index.mjs").is_file()
+    assert not (root / "relay" / "dist" / "src" / "index.js").exists()
+    for name in ("index.html", "vite.config.ts", "tsconfig.json", "env.d.ts"):
+        assert (root / name).is_file(), name
+    assert _relay_entry(root) == Path("relay/index.mjs")
+
+    lines = npm_log.read_text().splitlines()
+    assert any(line.startswith("ci ") for line in lines)
+    assert "run build_client" in lines
+    assert not any("build_server" in line or "build:relay" in line for line in lines)
+
+    marker = json.loads((root / ".proofquest-serve-ready").read_text())
+    assert marker["compat"] == "compat1"
+    assert marker["node"] == _LEGACY_NODE_VERSION
+    assert marker["host"] == "127.0.0.1"
+    assert marker["policy"] == "local-only-v1"
+    relay_text = (root / "relay" / "index.mjs").read_text()
+    assert ".listen(PORT, '127.0.0.1'," in relay_text
+    assert "new WebSocketServer({ server })" not in relay_text
+    assert "verifyClient: ({ origin }) => !origin || localOrigins.has(origin)" in relay_text
+    assert relay_text.count("(_req, res) => res.sendStatus(404)") == 2
+    assert "importStatus)" not in relay_text
+    assert "importTrigger)" not in relay_text
+    assert set(marker["vendor"]) == {"lean4", "lean4-infoview", "lean4web"}
+    assert all(
+        marker["vendor"][pin.dep]["sha"] == pin.sha for pin in _LEGACY_VENDOR_PINS
+    )
+
+    manifest = json.loads((root / "package.json").read_text())
+    assert manifest["dependencies"]["lean4-infoview"].startswith("file:vendor/")
+    assert manifest["dependencies"]["lean4web"].startswith("file:vendor/")
+    assert manifest["dependencies"]["express"] == "^4.18.2"
+
+    lock_text = (root / "package-lock.json").read_text()
+    assert "gitpkg" not in lock_text and "git+ssh" not in lock_text
+    lock = json.loads(lock_text)
+    express = lock["packages"]["node_modules/express"]
+    assert express["version"] == "4.18.2"
+    assert express["resolved"].endswith("express-4.18.2.tgz")
+    assert express["integrity"] == "sha512-EXPRESS"
+    for pin in _LEGACY_VENDOR_PINS:
+        entry = lock["packages"][f"node_modules/{pin.dep}"]
+        assert entry["resolved"].startswith("file:")
+        assert entry["integrity"].startswith("sha512-")
+        assert "OLD" not in entry["integrity"]
+
+    for pin in _LEGACY_VENDOR_PINS:
+        tarball = root / "vendor" / pin.tarball
+        assert tarball.is_file()
+        with tarfile.open(tarball, "r:gz") as tar:
+            names = tar.getnames()
+        assert "package/package.json" in names
+        assert "package/src/index.ts" in names
+        assert "package/LICENSE" in names
+    with tarfile.open(root / "vendor" / "lean4web-0.1.0.tgz", "r:gz") as tar:
+        patched = json.loads(tar.extractfile("package/package.json").read())
+    assert patched["dependencies"]["lean4"].startswith("file:")
+    assert patched["dependencies"]["lean4"].endswith("lean4-0.0.119.tgz")
+
+
+def test_legacy_prepare_reuses_ready_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    calls = []
+
+    def counting_urlopen(url, timeout=None):
+        calls.append(url)
+        return _fake_urlopen_factory(node_payload, node_sums)(url, timeout)
+
+    monkeypatch.setattr("proofquest.serve.urllib.request.urlopen", counting_urlopen)
+    source = make_legacy_lean4game(tmp_path)
+    first = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    calls.clear()
+    second = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    assert second == first
+    assert calls == []
+
+
+def test_legacy_prepare_never_rewrites_partial_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    source = make_legacy_lean4game(tmp_path)
+    bad = dict(_vendor_payloads())
+    pin = next(p for p in _LEGACY_VENDOR_PINS if p.dep == "lean4web")
+    rootname = f"{pin.repo.split('/')[-1]}-{pin.sha}"
+    bad[(pin.repo, pin.sha)] = _tar_bytes(
+        {
+            f"{rootname}/package.json": json.dumps(
+                {
+                    "name": "lean4web",
+                    "version": "9.9.9",
+                    "dependencies": {"lean4": "https://gitpkg.now.sh/x"},
+                }
+            ).encode()
+        }
+    )
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums, vendors=bad),
+    )
+    with pytest.raises(ServeError, match="does not match the pinned package"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    cache = tmp_path / "cache" / "proofquest"
+    partial = cache / "lean4game-v4.7.0-compat1"
+    assert partial.is_dir()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    fixed = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    assert fixed.name == "lean4game-v4.7.0-compat1-2"
+    assert partial.is_dir()
+
+
+def test_legacy_ignores_old_patched_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    old = tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0"
+    (old / "relay" / "dist" / "src").mkdir(parents=True)
+    (old / "relay" / "dist" / "src" / "index.js").write_text("// shim\n")
+    (old / "relay" / "index.mjs").write_text("// raw\n")
+    (old / "client" / "dist").mkdir(parents=True)
+    (old / "client" / "dist" / "index.html").write_text("<html></html>")
+    (old / "package.json").write_text(json.dumps(LEGACY_PACKAGE_JSON))
+    (old / ".proofquest-serve-ready").write_text("{}")
+
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    root = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    assert root.name.endswith("-compat1")
+    assert root != old
+
+
+def test_legacy_node_hash_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    dist, node_payload, _ = _node_dist_payload()
+    bad_sums = f"{'0' * 64}  {dist}.tar.xz\n".encode()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, bad_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    with pytest.raises(ServeError, match="SHA256 mismatch"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    assert not (tmp_path / "cache" / "proofquest" / dist).exists()
+
+
+def test_legacy_node_traversal_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    dist, _, _ = _node_dist_payload()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:xz") as tar:
+        info = tarfile.TarInfo(f"{dist}/../evil")
+        info.size = 3
+        tar.addfile(info, io.BytesIO(b"bad"))
+    payload = buf.getvalue()
+    import hashlib
+
+    sums = f"{hashlib.sha256(payload).hexdigest()}  {dist}.tar.xz\n".encode()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(payload, sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    with pytest.raises(ServeError, match="escapes"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+
+
+def test_legacy_node_external_symlink_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    dist, _, _ = _node_dist_payload()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:xz") as tar:
+        info = tarfile.TarInfo(f"{dist}/bin/link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        tar.addfile(info)
+    payload = buf.getvalue()
+    import hashlib
+
+    sums = f"{hashlib.sha256(payload).hexdigest()}  {dist}.tar.xz\n".encode()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(payload, sums),
+    )
+    with pytest.raises(ServeError, match="points outside"):
+        _provision_legacy_node()
+    assert not (tmp_path / "cache" / "proofquest" / dist).exists()
+
+
+def test_pack_rejects_external_symlink(tmp_path):
+    source = tmp_path / "pkg"
+    source.mkdir()
+    (source / "real.txt").write_text("x")
+    (source / "link").symlink_to("/etc/passwd")
+    with pytest.raises(ServeError, match="links outside"):
+        _pack_package_dir(source, tmp_path / "out" / "x.tgz")
+
+
+def test_pack_allows_internal_symlink(tmp_path):
+    source = tmp_path / "pkg"
+    source.mkdir()
+    (source / "real.txt").write_text("x")
+    (source / "link").symlink_to("real.txt")
+    integrity = _pack_package_dir(source, tmp_path / "out" / "x.tgz")
+    assert integrity.startswith("sha512-")
+    with tarfile.open(tmp_path / "out" / "x.tgz", "r:gz") as tar:
+        member = tar.getmember("package/link")
+        assert member.issym() and member.linkname == "real.txt"
+
+
+def test_relay_entry_prefers_modern(tmp_path):
+    root = tmp_path / "rt"
+    (root / "relay" / "dist" / "src").mkdir(parents=True)
+    (root / "relay" / "dist" / "src" / "index.js").write_text("//\n")
+    (root / "relay" / "index.mjs").write_text("//\n")
+    assert _relay_entry(root) == Path("relay/dist/src/index.js")
+    (root / "relay" / "dist" / "src" / "index.js").unlink()
+    assert _relay_entry(root) == Path("relay/index.mjs")
+
+
+def test_modern_tree_not_legacy(tmp_path):
+    source = make_lean4game(tmp_path / "lean4game")
+    assert not _legacy_runtime(source)
+
+
+def _legacy_prep(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    return ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda m: m.update(node="v99.0.0"),
+        lambda m: m.pop("host"),
+        lambda m: m["vendor"]["lean4"].update(integrity="sha512-bogus"),
+        lambda m: m["vendor"]["lean4"].update(sha="0" * 40),
+        lambda m: m.pop("vendor"),
+        lambda m: m.update(ref="v4.8.0"),
+        lambda m: m["vendor"]["lean4"].update(tarball="other.tgz"),
+        lambda m: m.update(policy="unsafe"),
+        lambda m: m.pop("policy"),
+    ],
+)
+def test_legacy_ready_rejects_bad_marker(tmp_path, monkeypatch, corrupt):
+    root = _legacy_prep(tmp_path, monkeypatch)
+    marker_path = root / ".proofquest-serve-ready"
+    data = json.loads(marker_path.read_text())
+    corrupt(data)
+    marker_path.write_text(json.dumps(data))
+    fresh = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(tmp_path / "lean4game-legacy"))
+    assert fresh != root
+    assert root.is_dir()
+
+
+def test_legacy_ready_rejects_missing_tarball(tmp_path, monkeypatch):
+    root = _legacy_prep(tmp_path, monkeypatch)
+    (root / "vendor" / "lean4-0.0.119.tgz").unlink()
+    fresh = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(tmp_path / "lean4game-legacy"))
+    assert fresh != root
+
+
+def test_legacy_ready_rejects_tampered_tarball(tmp_path, monkeypatch):
+    root = _legacy_prep(tmp_path, monkeypatch)
+    (root / "vendor" / "lean4-0.0.119.tgz").write_bytes(b"tampered")
+    fresh = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(tmp_path / "lean4game-legacy"))
+    assert fresh != root
+
+
+def test_legacy_ready_rejects_missing_host_bind(tmp_path, monkeypatch):
+    root = _legacy_prep(tmp_path, monkeypatch)
+    marker = root / ".proofquest-serve-ready"
+    data = json.loads(marker.read_text())
+    del data["host"]
+    marker.write_text(json.dumps(data))
+    fresh = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(tmp_path / "lean4game-legacy"))
+    assert fresh != root
+
+
+def test_lock_migration_fails_closed_on_wrong_sha(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    lock = json.loads((source / "package-lock.json").read_text())
+    lock["packages"]["node_modules/lean4"]["resolved"] = lock["packages"][
+        "node_modules/lean4"
+    ]["resolved"].replace("8d0cc34dcfa00da8b4a48394ba1fb3a600e3f985", "1" * 40)
+    (source / "package-lock.json").write_text(json.dumps(lock))
+    with pytest.raises(ServeError, match="unsupported lean4 lockfile pin"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    partial = tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-compat1"
+    assert json.loads((partial / "package.json").read_text()) == LEGACY_PACKAGE_JSON
+    assert "gitpkg" in (partial / "package-lock.json").read_text()
+
+
+def test_lock_migration_fails_closed_on_wrong_manifest_spec(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    manifest = json.loads((source / "package.json").read_text())
+    manifest["dependencies"]["lean4web"] = "github:hhu-adam/lean4web#" + "0" * 40
+    (source / "package.json").write_text(json.dumps(manifest))
+    with pytest.raises(ServeError, match="unsupported lean4web reference"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    partial = tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-compat1"
+    assert "github:hhu-adam" in (partial / "package.json").read_text()
+    assert "file:vendor" not in (partial / "package.json").read_text()
+
+
+def test_lock_migration_fails_closed_on_missing_dep(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    manifest = json.loads((source / "package.json").read_text())
+    del manifest["dependencies"]["lean4web"]
+    (source / "package.json").write_text(json.dumps(manifest))
+    with pytest.raises(ServeError, match="unsupported lean4web reference"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+
+
+def test_vendor_rejects_wrong_lean4_spec(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    bad = dict(_vendor_payloads())
+    pin = next(p for p in _LEGACY_VENDOR_PINS if p.dep == "lean4web")
+    rootname = f"{pin.repo.split('/')[-1]}-{pin.sha}"
+    bad[(pin.repo, pin.sha)] = _tar_bytes(
+        {
+            f"{rootname}/package.json": json.dumps(
+                {
+                    "name": "lean4web",
+                    "version": "0.1.0",
+                    "dependencies": {
+                        "lean4": "https://gitpkg.now.sh/leanprover/vscode-lean4"
+                        "/vscode-lean4?different-sha"
+                    },
+                }
+            ).encode()
+        }
+    )
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums, vendors=bad),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    with pytest.raises(ServeError, match="unsupported lean4 reference"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+
+
+def test_legacy_relay_missing_bind_line_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    (source / "relay" / "index.mjs").write_text("// no listen line\n")
+    with pytest.raises(ServeError, match="does not contain the expected"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        ".listen(PORT, () => console.log(`Listening on ${PORT}`));",
+        "const wss = new WebSocketServer({ server })",
+        "router.get('/import/status/:owner/:repo', importStatus)",
+        "router.get('/import/trigger/:owner/:repo', importTrigger)",
+    ],
+)
+def test_legacy_relay_missing_fragment_fails(tmp_path, monkeypatch, fragment):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums),
+    )
+    source = make_legacy_lean4game(tmp_path)
+    relay = source / "relay" / "index.mjs"
+    relay.write_text(relay.read_text().replace(fragment, "// removed\n"))
+    with pytest.raises(ServeError, match="does not contain the expected"):
+        ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
+    copied = (
+        tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-compat1"
+        / "relay" / "index.mjs"
+    ).read_text()
+    assert "127.0.0.1" not in copied and "verifyClient" not in copied
+
+
+def test_legacy_ready_rejects_nondict_marker(tmp_path, monkeypatch):
+    root = _legacy_prep(tmp_path, monkeypatch)
+    for payload in ("null", "[1, 2]", "42", '"text"'):
+        (root / ".proofquest-serve-ready").write_text(payload)
+        fresh = ensure_runtime(
+            tmp_path, "v4.7.0", lean4game=str(tmp_path / "lean4game-legacy")
+        )
+        assert fresh != root
+        (root / ".proofquest-serve-ready").unlink()
+
+
+def test_pack_deterministic_and_exec_bits(tmp_path):
+    source = tmp_path / "pkg"
+    (source / "sub").mkdir(parents=True)
+    (source / "run.sh").write_text("#!/bin/sh\n")
+    (source / "run.sh").chmod(0o755)
+    (source / "sub" / "data.txt").write_text("x")
+    first = _pack_package_dir(source, tmp_path / "a.tgz")
+    second = _pack_package_dir(source, tmp_path / "b.tgz")
+    assert first == second
+    assert (tmp_path / "a.tgz").read_bytes() == (tmp_path / "b.tgz").read_bytes()
+    with tarfile.open(tmp_path / "a.tgz", "r:gz") as tar:
+        assert tar.getmember("package/run.sh").mode == 0o755
+        assert tar.getmember("package/sub/data.txt").mode == 0o644
+
+
+def test_pack_internal_dir_symlink(tmp_path):
+    source = tmp_path / "pkg"
+    (source / "realdir").mkdir(parents=True)
+    (source / "realdir" / "f.txt").write_text("x")
+    (source / "alias").symlink_to("realdir")
+    _pack_package_dir(source, tmp_path / "x.tgz")
+    with tarfile.open(tmp_path / "x.tgz", "r:gz") as tar:
+        member = tar.getmember("package/alias")
+        assert member.issym() and member.linkname == "realdir"
+
+
+def test_node_sums_blank_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _dist, node_payload, node_sums = _node_dist_payload()
+    monkeypatch.setattr(
+        "proofquest.serve.urllib.request.urlopen",
+        _fake_urlopen_factory(node_payload, node_sums + b"\n\n  \n"),
+    )
+    node = _provision_legacy_node()
+    assert node.is_file()
