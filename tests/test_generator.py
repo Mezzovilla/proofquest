@@ -2766,3 +2766,78 @@ def test_noncomputable_section_wraps_generated_definitions(tmp_path):
     block = defs.index("noncomputable section")
     assert defs.index("def d : Nat := 0") > block
     assert "noncomputable section\n\ndef e" not in defs
+
+
+def _v47_game():
+    blueprint = Blueprint(
+        nodes=[
+            _theorem_node("lem:Foo.one", 0),
+            _theorem_node("lem:Foo.two", 1),
+        ],
+        chapters=["Ch"],
+    )
+    decls = {
+        "Foo.one": _decl(
+            name="one", full_name="Foo.one", namespace="Foo",
+            signature=": True", proof="by trivial",
+            source_text="theorem one : True := by\n  trivial",
+            noncomputable_section=True,
+        ),
+        "Foo.two": _decl(
+            name="two", full_name="Foo.two", namespace="Foo",
+            signature=": True", proof="by exact Foo.one",
+            source_text="theorem two : True := by\n  exact Foo.one",
+        ),
+    }
+    return build_game(blueprint, decls, toolchain="v4.7.0", title="T")
+
+
+def test_inventory_support_emitted_for_lean_47(tmp_path):
+    game = _v47_game()
+    written = write_game(game, tmp_path)
+    names = {str(p.relative_to(tmp_path)) for p in written}
+
+    assert "Game/Generated/Inventory.lean" in names
+    inventory = (tmp_path / "Game/Generated/Inventory.lean").read_text()
+    assert inventory.startswith("import GameServer.Commands\n")
+    assert "def completeInventory" in inventory
+    assert "def exerciseNames : Array Lean.Name := #[`Foo.one, `Foo.two]" in inventory
+
+    metadata = (tmp_path / "Game/Metadata.lean").read_text()
+    assert "import Game.Generated.Inventory" in metadata
+
+    for stem in ("L01_one", "L02_two"):
+        level = (tmp_path / f"Game/Levels/Ch/{stem}.lean").read_text()
+        run_cmd = (
+            "run_cmd _root_.ProofQuest.completeInventory "
+            "_root_.ProofQuest.exerciseNames"
+        )
+        assert run_cmd in level
+        assert level.index(run_cmd) > level.index("Statement")
+
+    one = (tmp_path / "Game/Levels/Ch/L01_one.lean").read_text()
+    assert one.index("run_cmd") < one.index("\nend")
+
+
+@pytest.mark.parametrize("toolchain", ["v4.31.0", "v4.8.0", "v4.9.1"])
+def test_no_inventory_support_for_modern_toolchain(tmp_path, toolchain):
+    blueprint = Blueprint(
+        nodes=[_theorem_node("lem:t", 0)],
+        chapters=["Ch"],
+    )
+    decls = {
+        "t": _decl(
+            name="t", full_name="t", signature=": True",
+            proof="by trivial",
+            source_text="theorem t : True := by\n  trivial",
+        ),
+    }
+    game = build_game(blueprint, decls, toolchain=toolchain, title="T")
+    written = write_game(game, tmp_path)
+    names = {str(p.relative_to(tmp_path)) for p in written}
+
+    assert "Game/Generated/Inventory.lean" not in names
+    metadata = (tmp_path / "Game/Metadata.lean").read_text()
+    assert "import Game.Generated.Inventory" not in metadata
+    level = (tmp_path / "Game/Levels/Ch/L01_t.lean").read_text()
+    assert "run_cmd" not in level

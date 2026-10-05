@@ -2411,6 +2411,7 @@ def _render_level(
     level: Level,
     previous: Level | None,
     staged_module: str | None = None,
+    inventory_support: bool = False,
 ) -> str:
     decl = level.decl
     # Levels get Mathlib transitively via Game.Metadata -> Game.Generated.Defs,
@@ -2451,6 +2452,11 @@ def _render_level(
         footer.append("NewDefinition " + " ".join(d.full_name for d in level.new_definitions))
     if level.new_theorems:
         footer.append("NewTheorem " + " ".join(level.new_theorems))
+    if inventory_support:
+        footer.append(
+            "run_cmd _root_.ProofQuest.completeInventory "
+            "_root_.ProofQuest.exerciseNames"
+        )
     footer_block = "\n\n" + "\n".join(footer) if footer else ""
 
     parts.extend(_context_scaffolds(decl, game.project_scopes))
@@ -2693,6 +2699,15 @@ import Game.Generated.TheoremDocs
 /-! Things imported here are available in all levels. -/
 """
 
+_METADATA_INVENTORY = """import GameServer
+import Game.Generated.Defs
+import Game.Generated.TacticDocs
+import Game.Generated.TheoremDocs
+import Game.Generated.Inventory
+
+/-! Things imported here are available in all levels. -/
+"""
+
 _LAKEFILE = '''import Lake
 open Lake DSL
 
@@ -2801,10 +2816,81 @@ def _legacy_lakefile_syntax(toolchain: str) -> bool:
 _GITIGNORE = """.lake/
 """
 
+_INVENTORY_SUPPORT = """import GameServer.Commands
+
+open Lean Elab Command
+
+namespace ProofQuest
+
+def completeInventory (exercises : Array Name) : CommandElabM Unit := do
+  let game ← getCurGame
+  let currentWorld ← getCurWorldId
+  let currentIndex ← getCurLevelIdx
+  let level ← getCurLevel
+  let mut knownTactics : Array Name := #[]
+  let mut knownLemmas : Array Name := #[]
+  let mut knownDefinitions : Array Name := #[]
+  for (worldName, world) in game.worlds.nodes.toArray do
+    for (levelIndex, previous) in world.levels.toArray do
+      if worldName != currentWorld || levelIndex != currentIndex then
+        knownTactics := knownTactics ++ previous.tactics.new
+        knownLemmas := knownLemmas ++ previous.lemmas.new
+        knownDefinitions := knownDefinitions ++ previous.definitions.new
+  let tactics := (level.tactics.new ++ level.tactics.used).filter fun name =>
+    !knownTactics.contains name
+  let lemmas := (level.lemmas.new ++ level.lemmas.used).filter fun name =>
+    !knownLemmas.contains name && !exercises.contains name
+  let definitions := (level.definitions.new ++ level.definitions.used).filter fun name =>
+    !knownDefinitions.contains name && !exercises.contains name
+  let unique := fun (names : Array Name) =>
+    (names.foldl (fun acc name => if acc.contains name then acc else acc.push name) #[]).qsort
+      (fun a b => a.toString < b.toString)
+  let tactics := unique tactics
+  let lemmas := unique lemmas
+  let definitions := unique definitions
+  for name in tactics do
+    checkInventoryDoc .Tactic (mkIdent name) (name := name) (template := some "")
+  for name in lemmas do
+    checkInventoryDoc .Lemma (mkIdent name) (name := name) (template := some "")
+  for name in definitions do
+    checkInventoryDoc .Definition (mkIdent name) (name := name) (template := some "")
+  modifyCurLevel fun current => pure { current with
+    tactics := { current.tactics with new := tactics }
+    lemmas := { current.lemmas with new := lemmas }
+    definitions := { current.definitions with new := definitions } }
+
+end ProofQuest
+"""
+
+
+def _needs_inventory_support(toolchain: str) -> bool:
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", toolchain)
+    return match is not None and (
+        int(match.group(1)), int(match.group(2))
+    ) == (4, 7)
+
+
+def _render_inventory_support(game: Game) -> str:
+    names: list[str] = []
+    seen: set[str] = set()
+    for world in game.worlds:
+        for level in world.levels:
+            if level.decl.full_name not in seen:
+                seen.add(level.decl.full_name)
+                names.append(level.decl.full_name)
+    literals = ", ".join(f"`{name}" for name in names)
+    return (
+        _INVENTORY_SUPPORT
+        + "\nnamespace ProofQuest\n\n"
+        + f"def exerciseNames : Array Lean.Name := #[{literals}]\n\n"
+        + "end ProofQuest\n"
+    )
+
 
 def write_game(game: Game, output_dir: Path) -> list[Path]:
     """Render the game to ``output_dir``; returns the list of files written."""
     stages = game.stages or [DefsStage(index=0, definitions=game.definitions)]
+    inventory_support = _needs_inventory_support(game.toolchain)
     stage_by_index = {stage.index: stage for stage in stages}
     n_levels = sum(len(world.levels) for world in game.worlds)
     trailing = (
@@ -2815,7 +2901,10 @@ def write_game(game: Game, output_dir: Path) -> list[Path]:
 
     files: list[tuple[str, str]] = [
         ("Game.lean", _render_game_root(game, [trailing] if trailing else None)),
-        ("Game/Metadata.lean", _METADATA),
+        (
+            "Game/Metadata.lean",
+            _METADATA_INVENTORY if inventory_support else _METADATA,
+        ),
     ]
     for stage in stages:
         files.append(
@@ -2826,6 +2915,10 @@ def write_game(game: Game, output_dir: Path) -> list[Path]:
         )
     files.append(("Game/Generated/TacticDocs.lean", _render_tactic_docs(game)))
     files.append(("Game/Generated/TheoremDocs.lean", _render_theorem_docs(game)))
+    if inventory_support:
+        files.append(
+            ("Game/Generated/Inventory.lean", _render_inventory_support(game))
+        )
 
     previous: Level | None = None
     position = 0
@@ -2848,6 +2941,7 @@ def write_game(game: Game, output_dir: Path) -> list[Path]:
                         staged_module=(
                             stage.module if stage is not None else None
                         ),
+                        inventory_support=inventory_support,
                     ),
                 )
             )
