@@ -9,7 +9,7 @@ from pathlib import Path
 from .blueprint_parser import BlueprintError, parse_blueprint
 from .dep_graph import DependencyError, topological_order
 from .generator import GenerationError, build_game, write_game
-from .lean_parser import parse_project
+from .lean_parser import _dependency_theorem_index, parse_project
 from .serve import ServeError, cmd_serve
 from .toolchain import game_toolchain
 from .validate import validate
@@ -145,12 +145,14 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if errors:
         return 1
 
+    theorem_index = _dependency_theorem_index(project_dir / ".lake" / "packages") or None
     game = build_game(
         blueprint,
         decls,
         toolchain=toolchain,
         title=args.title or _default_title(project_dir),
         languages=args.lang,
+        theorem_index=theorem_index,
     )
     written = write_game(game, output_dir)
     print(f"generated {len(written)} files in {args.output}")

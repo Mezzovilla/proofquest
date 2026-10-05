@@ -1427,6 +1427,59 @@ def _module_local_syntax(
     return syntax, notations, tuple(context), instances
 
 
+_DEP_DECL_NAME_RE = re.compile(
+    r"^\s*(?:@\[[^\]]*\]\s*)?((?:" + _MODS + r"\s+)*)"
+    r"(?:theorem|lemma)\s+([^\s(:{«\[@]+)"
+)
+
+
+def _dependency_theorem_index(packages_dir: Path) -> dict[str, set[str]]:
+    """Index ``short name → full names`` of theorems in dependency sources."""
+    index: dict[str, set[str]] = {}
+    if not packages_dir.is_dir():
+        return index
+    for package in sorted(packages_dir.iterdir()):
+        if not package.is_dir():
+            continue
+        for path in package.rglob("*.lean"):
+            if ".lake" in path.relative_to(package).parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            stack: list[str] = []
+            for line in _masked_source(text)[0]:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                scope_match = _SCOPE_COMMAND_RE.match(stripped)
+                if scope_match is not None:
+                    _mods, kind_word, rest = scope_match.groups()
+                    stack.append(
+                        rest.strip() if kind_word == "namespace" else ""
+                    )
+                    continue
+                if stripped == "end" or stripped.startswith("end "):
+                    if stack:
+                        stack.pop()
+                    continue
+                decl = _DEP_DECL_NAME_RE.match(line)
+                if decl is None:
+                    continue
+                if "private" in decl.group(1).split():
+                    continue
+                name = decl.group(2)
+                if name.startswith("_root_."):
+                    full = name.removeprefix("_root_.")
+                else:
+                    full = ".".join(
+                        [part for part in stack if part] + [name]
+                    )
+                index.setdefault(full.rpartition(".")[2], set()).add(full)
+    return index
+
+
 def _generated_roots(project_dir: Path) -> list[Path]:
     roots: list[Path] = []
     for game_root in sorted(

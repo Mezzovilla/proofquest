@@ -97,6 +97,7 @@ class LeanDecl:
     instances: list[LeanDecl] = field(default_factory=list)
     context_namespace: str | None = None
     noncomputable_section: bool = False
+    external_namespaces: frozenset[str] = frozenset()
 
     @property
     def is_definition(self) -> bool:

@@ -17,6 +17,7 @@ from proofquest.generator import (
     _looks_like_theorem_name,
     _obtain_binder_types,
     _qualify_project_refs,
+    _resolve_inventory_name,
     _resolve_project_decl,
     _source_refs,
     _statement_proof,
@@ -1101,6 +1102,42 @@ def test_ambiguous_opened_namespaces_via_commands_reject():
         _resolve_project_decl("k", caller, decls)
 
 
+def test_resolve_inventory_name_namespace_then_root_then_opened():
+    caller = _decl(name="c", full_name="A.c", namespace="A")
+    index = {"lem": {"A.lem", "B.lem", "lem"}}
+    assert _resolve_inventory_name("lem", caller, {}, index) == "A.lem"
+    root_caller = _decl(name="c", full_name="c", opens=["open B"])
+    assert _resolve_inventory_name("lem", root_caller, {}, index) == "lem"
+
+
+def test_resolve_inventory_name_ambiguous_opened_is_omitted():
+    caller = _decl(name="c", full_name="c", opens=["open A", "open B"])
+    index = {"lem": {"A.lem", "B.lem"}}
+    assert _resolve_inventory_name("lem", caller, {}, index) is None
+
+
+def test_resolve_inventory_name_expands_suffix_opens_via_commands():
+    other = _decl(
+        name="other", full_name="NumberField.Units.other",
+        namespace="NumberField.Units",
+    )
+    caller = _decl(
+        name="mem", full_name="IsCyclotomicExtension.Rat.Three.mem",
+        namespace="IsCyclotomicExtension.Rat.Three",
+        opens=["open _root_.NumberField", "open _root_.Units"],
+        context=(
+            _open_command("open NumberField"),
+            _open_command("open Units"),
+        ),
+    )
+    index = {"rank": {"NumberField.Units.rank"}}
+    decls = {other.full_name: other}
+    assert (
+        _resolve_inventory_name("rank", caller, decls, index)
+        == "NumberField.Units.rank"
+    )
+
+
 def test_dotted_decl_prefix_resolves_bare_refs():
     lemma = _decl(
         name="multiplicity_lambda_c_finite",
@@ -1154,6 +1191,48 @@ def test_root_qualified_refs_are_never_rewritten():
     )
     assert "_root_.Outer.dep" in out
     assert "_root_._root_" not in out
+
+
+def test_external_namespace_tokens_are_not_requalified():
+    decls = {
+        "Solution.multiplicity": _decl(
+            keyword="def", name="multiplicity",
+            full_name="Solution.multiplicity", namespace="Solution",
+            source_text="def multiplicity : Nat :=\n  1",
+        ),
+    }
+    caller = _decl(
+        name="w", full_name="Solution.w", namespace="Solution",
+        external_namespaces=frozenset({"multiplicity"}),
+    )
+    out = _qualify_project_refs(
+        "(multiplicity.pow_multiplicity_dvd h).choose", {"h"}, caller, decls
+    )
+    assert "multiplicity.pow_multiplicity_dvd" in out
+    assert "_root_.Solution.multiplicity" not in out
+
+
+def test_project_extension_of_external_namespace_qualifies_exact():
+    decls = {
+        "Solution.multiplicity": _decl(
+            keyword="def", name="multiplicity",
+            full_name="Solution.multiplicity", namespace="Solution",
+            source_text="def multiplicity : Nat :=\n  1",
+        ),
+        "Solution.multiplicity.locallemma": _decl(
+            name="locallemma",
+            full_name="Solution.multiplicity.locallemma",
+            namespace="Solution.multiplicity",
+        ),
+    }
+    caller = _decl(
+        name="w", full_name="Solution.w", namespace="Solution",
+        external_namespaces=frozenset({"multiplicity"}),
+    )
+    out = _qualify_project_refs(
+        "multiplicity.locallemma", set(), caller, decls
+    )
+    assert out == "_root_.Solution.multiplicity.locallemma"
 
 
 def test_free_constant_projection_still_qualified():
@@ -1916,6 +1995,31 @@ def test_term_proof_inventory_uses_normalized_exact():
     assert "helper_lemma" not in level_t.new_theorems
 
 
+def test_level_inventory_skips_method_projection_tokens():
+    blueprint = Blueprint(
+        nodes=[_theorem_node("lem:t", 0)], chapters=["Ch"],
+    )
+    decls = {
+        "t": _decl(
+            name="t", full_name="t",
+            signature=": 0 = 0",
+            proof="by\n  exact Int.prime_three.dvd_of_dvd_pow le_max_left",
+        ),
+    }
+    index = {
+        "dvd_of_dvd_pow": {"Prime.dvd_of_dvd_pow"},
+        "prime_three": {"Int.prime_three"},
+        "le_max_left": {"le_max_left"},
+    }
+    game = build_game(
+        blueprint, decls, toolchain="v4.31.0", title="T",
+        theorem_index=index,
+    )
+    level = game.worlds[0].levels[0]
+    assert "Int.prime_three.dvd_of_dvd_pow" not in level.new_theorems
+    assert "le_max_left" in level.new_theorems
+
+
 def test_context_replay_registers_instance_before_attribute_disable():
     inst = _decl(
         keyword="instance", name="instX", full_name="instX",
@@ -2314,6 +2418,67 @@ def test_source_refs_follow_extends_projection_chain():
     refs = _source_refs(decls["use"], decls)
     names = [r.full_name for r in refs]
     assert "Base.field" in names
+
+
+def test_resolve_inventory_name_drops_method_projection_syntax():
+    index = {
+        "dvd_of_dvd_pow": {"Prime.dvd_of_dvd_pow"},
+        "prime_three": {"Int.prime_three"},
+        "coe_nat_dvd": {"Int.coe_nat_dvd"},
+        "dvd_gcd": {"Finset.dvd_gcd", "Int.dvd_gcd"},
+    }
+    decl = _decl(name="t", full_name="t")
+    assert (
+        _resolve_inventory_name(
+            "Int.prime_three.dvd_of_dvd_pow", decl, {}, index
+        )
+        is None
+    )
+    assert (
+        _resolve_inventory_name("Prime.dvd_of_dvd_pow", decl, {}, index)
+        == "Prime.dvd_of_dvd_pow"
+    )
+    assert (
+        _resolve_inventory_name("Int.coe_nat_dvd", decl, {}, index)
+        == "Int.coe_nat_dvd"
+    )
+    assert _resolve_inventory_name("Int.dvd_gcd", decl, {}, index) == "Int.dvd_gcd"
+
+
+def test_resolve_inventory_name_root_marker_is_stripped():
+    index = {"dvd_of_dvd_pow": {"Prime.dvd_of_dvd_pow"}}
+    decl = _decl(name="t", full_name="t")
+    assert (
+        _resolve_inventory_name("_root_.Prime.dvd_of_dvd_pow", decl, {}, index)
+        == "Prime.dvd_of_dvd_pow"
+    )
+    assert _resolve_inventory_name("_root_.Missing.foo", decl, {}, index) is None
+
+
+def test_resolve_inventory_name_dotted_through_namespace_chain():
+    index = {"bar": {"Outer.Inner.bar"}}
+    decl = _decl(name="t", full_name="Outer.t", namespace="Outer")
+    assert (
+        _resolve_inventory_name("Inner.bar", decl, {}, index)
+        == "Outer.Inner.bar"
+    )
+    assert _resolve_inventory_name("Inner.bar", decl, {}, index) is not None
+    root_decl = _decl(name="t", full_name="t")
+    assert _resolve_inventory_name("Inner.bar", root_decl, {}, index) is None
+
+
+def test_resolve_inventory_name_unindexed_short_is_omitted():
+    index = {"other": {"A.other"}}
+    decl = _decl(name="t", full_name="t", opens=["open Int"])
+    assert _resolve_inventory_name("coe_nat_dvd", decl, {}, index) is None
+
+
+def test_resolve_inventory_name_no_index_compatibility():
+    decl = _decl(name="t", full_name="t")
+    assert (
+        _resolve_inventory_name("Int.prime_three.dvd_of_dvd_pow", decl, {}, None)
+        == "Int.prime_three.dvd_of_dvd_pow"
+    )
 
 
 def test_qualify_project_refs_never_rewrites_header_name():

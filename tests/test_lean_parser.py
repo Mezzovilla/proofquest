@@ -4,6 +4,7 @@ from proofquest.game_model import Game
 from proofquest.generator import _render_defs
 from proofquest.lean_parser import (
     LeanParseError,
+    _dependency_theorem_index,
     _masked_source,
     _ns_interpretations,
     _parse_file,
@@ -1350,3 +1351,35 @@ def test_instance_disable_does_not_leak_to_importer(tmp_path):
     assert not [
         c for c in decls["importer_late"].context if c.kind == "attribute"
     ]
+
+
+def test_dependency_theorem_index_names(tmp_path):
+    package = tmp_path / "dep"
+    (package / "Thing.lean").parent.mkdir(parents=True)
+    (package / "Thing.lean").write_text(
+        "namespace Outer\n"
+        "theorem foo : True := trivial\n"
+        "@[simp] theorem bar : True := trivial\n"
+        "private theorem secret : True := trivial\n"
+        "theorem _root_.Rooted.top : True := trivial\n"
+        "end Outer\n"
+        "namespace N\n"
+        "theorem exported_lemma : True := trivial\n"
+        "end N\n"
+        "export N (exported_lemma)\n"
+        "section\n"
+        "theorem sec_thm : True := trivial\n"
+        "end\n"
+        "/- theorem in_block_comment : True := trivial -/\n"
+        "-- theorem in_line_comment : True := trivial\n",
+        encoding="utf-8",
+    )
+    index = _dependency_theorem_index(tmp_path)
+    assert index["foo"] == {"Outer.foo"}
+    assert index["bar"] == {"Outer.bar"}
+    assert index["top"] == {"Rooted.top"}
+    assert index["sec_thm"] == {"sec_thm"}
+    assert index["exported_lemma"] == {"N.exported_lemma"}
+    assert "secret" not in index
+    assert "in_block_comment" not in index
+    assert "in_line_comment" not in index

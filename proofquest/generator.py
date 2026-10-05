@@ -1102,6 +1102,70 @@ def _looks_like_theorem_name(name: str) -> bool:
     return any("_" in part for part in name.split("."))
 
 
+def _resolve_inventory_name(
+    name: str,
+    decl: LeanDecl,
+    decls: dict[str, LeanDecl],
+    index: dict[str, set[str]] | None,
+) -> str | None:
+    if not index:
+        return name
+
+    def indexed(full: str) -> bool:
+        return full in index.get(full.rpartition(".")[2], ())
+
+    namespace = _elaboration_namespace(decl)
+    enclosing = _context_namespace(decl)
+    chains: list[str] = []
+    for scope in (namespace, enclosing):
+        if not scope:
+            continue
+        parts = scope.split(".")
+        for i in range(len(parts), 0, -1):
+            candidate = ".".join(parts[:i])
+            if candidate not in chains:
+                chains.append(candidate)
+    if "." in name:
+        if name.startswith("_root_."):
+            token = name.removeprefix("_root_.")
+            return token if indexed(token) else None
+        for scope in chains:
+            candidate = scope + "." + name
+            if indexed(candidate):
+                return candidate
+        if indexed(name):
+            return name
+        opened_matches = {
+            f"{opened}.{name}"
+            for opened in _opened_namespaces(
+                _decl_open_entries(decl), enclosing, _known_namespaces(decls)
+            )
+            if indexed(f"{opened}.{name}")
+        }
+        if len(opened_matches) == 1:
+            return next(iter(opened_matches))
+        return None
+    fulls = index.get(name)
+    if not fulls:
+        return None
+    for scope in chains:
+        candidate = scope + "." + name
+        if candidate in fulls:
+            return candidate
+    if name in fulls:
+        return name
+    matches = {
+        f"{opened}.{name}"
+        for opened in _opened_namespaces(
+            _decl_open_entries(decl), enclosing, _known_namespaces(decls)
+        )
+        if f"{opened}.{name}" in fulls
+    }
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
+
+
 def _is_declared_theorem(name: str, decl: LeanDecl, decls: dict[str, LeanDecl]) -> bool:
     """Whether ``name`` is trustworthy enough to declare with `NewTheorem`.
 
@@ -1514,6 +1578,7 @@ def build_game(
     toolchain: str,
     title: str,
     languages: str = "en",
+    theorem_index: dict[str, set[str]] | None = None,
 ) -> Game:
     """Turn the parsed blueprint + Lean declarations into a game model."""
     order = topological_order(blueprint)
@@ -1538,6 +1603,16 @@ def build_game(
                 def_node_by_name[name] = node
 
     project_scopes = _project_scopes(decls)
+    if theorem_index:
+        external_namespaces = frozenset(
+            ".".join(parts[:i])
+            for names in theorem_index.values()
+            for full in names
+            for parts in [full.split(".")]
+            for i in range(1, len(parts))
+        )
+        for decl in decls.values():
+            decl.external_namespaces = external_namespaces
     definitions: list[tuple[LeanDecl, BlueprintNode | None]] = []
     def_closure_by_label: dict[str, list[LeanDecl]] = {}
     emitted_defs: set[str] = set()
@@ -1795,9 +1870,10 @@ def build_game(
                     continue  # project-local: unlocked automatically once solved
                 if not _is_declared_theorem(theorem, decl, decls):
                     continue  # cannot verify it exists and is a theorem: skip it
-                if theorem not in introduced_theorems:
-                    introduced_theorems.append(theorem)
-                    new_theorems.append(theorem)
+                resolved = _resolve_inventory_name(theorem, decl, decls, theorem_index)
+                if resolved is not None and resolved not in introduced_theorems:
+                    introduced_theorems.append(resolved)
+                    new_theorems.append(resolved)
 
         index = len(world.levels) + 1
         level = Level(
@@ -2059,6 +2135,12 @@ def _qualify_project_refs(
             raw, namespace, opens, decls, decl.full_name, enclosing=enclosing
         )
         if dep is None:
+            parts = raw.split(".")
+            if len(parts) > 1 and any(
+                ".".join(parts[:i]) in decl.external_namespaces
+                for i in range(1, len(parts))
+            ):
+                continue
             probe = raw.rpartition(".")[0]
             while probe:
                 dep = _resolve_context_decl(
