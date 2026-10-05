@@ -1610,6 +1610,11 @@ def build_game(
                 "move the declaration to a module that does not rely on "
                 "project-local opens"
             )
+        if not (decl.proof or "").strip():
+            raise GenerationError(
+                f"level {node.label}: theorem {decl.full_name} has no "
+                "proof to reuse as the level's sample solution"
+            )
         theorem_decl[node.label] = decl
         decl_by_label[node.label] = decl
         for name in (*node.lean_names, decl.full_name):
@@ -1764,8 +1769,19 @@ def build_game(
 
         new_tactics: list[str] = []
         new_theorems: list[str] = []
-        if decl.proof and decl.proof.lstrip().startswith("by"):
-            proof_body = decl.proof.lstrip()[2:]
+        proof_text = (decl.proof or "").strip()
+        if proof_text:
+            if re.match(r"by\b", proof_text):
+                proof_body = proof_text[2:]
+            else:
+                term_lines = proof_text.splitlines()
+                proof_body = "exact " + "\n".join(
+                    [term_lines[0]]
+                    + [
+                        "  " + extra if extra.strip() else extra
+                        for extra in term_lines[1:]
+                    ]
+                )
             for tactic in _tactics_in_proof(proof_body):
                 if tactic not in introduced_tactics:
                     introduced_tactics.append(tactic)
@@ -2234,17 +2250,38 @@ def _statement_proof(level: Level, decls: dict[str, LeanDecl]) -> str:
     if level.hint_md:
         lines.append(f'Hint "{lean_interp_string(level.hint_md)}"')
     proof = (decl.proof or "").strip()
+    if not proof:
+        label = level.node.label if level.node is not None else decl.full_name
+        raise GenerationError(
+            f"level {label}: theorem {decl.full_name} has no "
+            "proof to reuse as the level's sample solution"
+        )
     bound = _binder_names(decl.signature) | _proof_bound_names(proof)
     for var_line in decl.variables:
         bound |= _binder_names(var_line)
-    if proof.startswith("by"):
+    if re.match(r"by\b", proof):
         body = _strip_redundant_set(proof[2:].strip("\n"), decl.signature)
         body = _qualify_project_refs(body, bound, decl, decls)
-        raw = [line for line in body.splitlines() if line.strip()]
-        indent = min(len(line) - len(line.lstrip()) for line in raw) if raw else 0
-        lines.extend(line[indent:] for line in raw)
+        masked, _sheltered = _masked_source(body)
+        raw = [
+            (line, mask)
+            for line, mask in zip(body.splitlines(), masked)
+            if line.strip()
+        ]
+        indent = min(
+            (len(line) - len(line.lstrip()) for line, mask in raw if mask.strip()),
+            default=0,
+        )
+        lines.extend(
+            line.lstrip() if not mask.strip() else line[indent:]
+            for line, mask in raw
+        )
     else:
-        lines.append("sorry")
+        proof = _qualify_project_refs(proof, bound, decl, decls)
+        term_lines = proof.splitlines()
+        lines.append("exact " + term_lines[0])
+        for extra in term_lines[1:]:
+            lines.append("  " + extra if extra.strip() else extra)
     return "by\n" + "\n".join(f"  {line}" for line in lines)
 
 
@@ -2597,14 +2634,6 @@ _GITIGNORE = """.lake/
 
 def write_game(game: Game, output_dir: Path) -> list[Path]:
     """Render the game to ``output_dir``; returns the list of files written."""
-    written: list[Path] = []
-
-    def emit(relative: str, content: str) -> None:
-        path = output_dir / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        written.append(path)
-
     stages = game.stages or [DefsStage(index=0, definitions=game.definitions)]
     stage_by_index = {stage.index: stage for stage in stages}
     n_levels = sum(len(world.levels) for world in game.worlds)
@@ -2614,44 +2643,67 @@ def write_game(game: Game, output_dir: Path) -> list[Path]:
         else None
     )
 
-    emit("Game.lean", _render_game_root(game, [trailing] if trailing else None))
-    emit("Game/Metadata.lean", _METADATA)
+    files: list[tuple[str, str]] = [
+        ("Game.lean", _render_game_root(game, [trailing] if trailing else None)),
+        ("Game/Metadata.lean", _METADATA),
+    ]
     for stage in stages:
-        emit(
-            f"Game/Generated/{stage.module_stem}.lean",
-            _render_defs_stage(game, stage),
+        files.append(
+            (
+                f"Game/Generated/{stage.module_stem}.lean",
+                _render_defs_stage(game, stage),
+            )
         )
-    emit("Game/Generated/TacticDocs.lean", _render_tactic_docs(game))
-    emit("Game/Generated/TheoremDocs.lean", _render_theorem_docs(game))
+    files.append(("Game/Generated/TacticDocs.lean", _render_tactic_docs(game)))
+    files.append(("Game/Generated/TheoremDocs.lean", _render_theorem_docs(game)))
 
     previous: Level | None = None
     position = 0
     for world in game.worlds:
-        emit(f"Game/Levels/{world.world_id}.lean", _render_world(world))
+        files.append(
+            (f"Game/Levels/{world.world_id}.lean", _render_world(world))
+        )
         for level in world.levels:
             position += 1
             stage = stage_by_index.get(position - 1)
             if stage is not None and stage.index == 0:
                 stage = None
-            emit(
-                f"Game/Levels/{world.world_id}/{level.file_stem}.lean",
-                _render_level(
-                    game,
-                    level,
-                    previous,
-                    staged_module=stage.module if stage is not None else None,
-                ),
+            files.append(
+                (
+                    f"Game/Levels/{world.world_id}/{level.file_stem}.lean",
+                    _render_level(
+                        game,
+                        level,
+                        previous,
+                        staged_module=(
+                            stage.module if stage is not None else None
+                        ),
+                    ),
+                )
             )
             previous = level
 
-    emit("lakefile.lean", _LAKEFILE)
-    emit("lean-toolchain", game.toolchain.strip() + "\n")
-    emit(".gitignore", _GITIGNORE)
-    emit(
-        "README.md",
-        f"# {game.title}\n\n"
-        "This game was generated by [proofquest] from a leanblueprint project.\n\n"
-        "Build it with `lake update -R && lake build`, then host it locally with\n"
-        "`proofquest serve <this-folder>` (no lean4game clone needed).\n",
+    files.append(("lakefile.lean", _LAKEFILE))
+    files.append(("lean-toolchain", game.toolchain.strip() + "\n"))
+    files.append((".gitignore", _GITIGNORE))
+    files.append(
+        (
+            "README.md",
+            (
+                f"# {game.title}\n\n"
+                "This game was generated by [proofquest] from a leanblueprint"
+                " project.\n\n"
+                "Build it with `lake update -R && lake build`, then host it"
+                " locally with\n"
+                "`proofquest serve <this-folder>` (no lean4game clone needed).\n"
+            ),
+        )
     )
+
+    written: list[Path] = []
+    for relative, content in files:
+        path = output_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        written.append(path)
     return written

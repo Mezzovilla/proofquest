@@ -855,6 +855,21 @@ def test_generate_renders_root_qualified_decl_in_source_namespace(tmp_path):
     assert "_root_.Inner.uses = _root_.Inner.uses" in level
 
 
+def test_generate_missing_proof_fails_before_writing(tmp_path, capsys):
+    project = tmp_path / "proj"
+    _write_rejection_project(
+        project,
+        "namespace Toy\n"
+        "def A : Nat := 1\n"
+        "theorem t : True\n"
+        "end Toy\n",
+    )
+    out = tmp_path / "game"
+    assert main(["generate", str(project), "-o", str(out)]) == 1
+    assert "no proof" in capsys.readouterr().err
+    assert not any(out.rglob("*"))
+
+
 def test_generate_split_definition_group_breaks_member_cycle(tmp_path):
     """FLT3 grouping: members defined *from* level theorems live in their
     own blueprint node so the def <-> level edge no longer cycles."""

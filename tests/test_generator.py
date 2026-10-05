@@ -216,8 +216,8 @@ def test_build_game_rejects_distinct_chapters_with_same_world_id():
         chapters=["A B", "A-B"],
     )
     decls = {
-        "first": _decl(name="first", full_name="first"),
-        "second": _decl(name="second", full_name="second"),
+        "first": _decl(name="first", full_name="first", proof="by trivial"),
+        "second": _decl(name="second", full_name="second", proof="by trivial"),
     }
 
     with pytest.raises(GenerationError) as exc_info:
@@ -1303,7 +1303,7 @@ def test_build_game_reuses_same_chapter_and_keeps_non_conflicting_worlds():
         chapters=["A B", "Different"],
     )
     decls = {
-        label: _decl(name=label, full_name=label)
+        label: _decl(name=label, full_name=label, proof="by trivial")
         for label in ("first", "second", "third")
     }
 
@@ -1826,6 +1826,94 @@ def _level(decl: LeanDecl, hint_md: str | None = None) -> Level:
         decl=decl,
         node=node,
     )
+
+
+def test_statement_proof_replays_term_proof():
+    decl = _decl(
+        name="t", full_name="t",
+        signature="(a b : Nat) : a + b = b + a",
+        proof="add_comm a b",
+    )
+    assert _statement_proof(_level(decl), {}) == "by\n  exact add_comm a b"
+
+
+def test_statement_proof_replays_bound_receiver_term():
+    decl = _decl(
+        name="t", full_name="t",
+        signature="(hζ : IsPrimitiveRoot ζ 3) : Prime λ",
+        proof="hζ.lambda_prime",
+    )
+    out = _statement_proof(_level(decl), {})
+    assert out == "by\n  exact hζ.lambda_prime"
+    assert "sorry" not in out
+
+
+def test_statement_proof_replays_multiline_calc_term():
+    proof = "calc\n    a = b := h1\n    _ = c := h2"
+    decl = _decl(name="t", full_name="t", proof=proof)
+    out = _statement_proof(_level(decl), {})
+    assert out == (
+        "by\n  exact calc\n        a = b := h1\n        _ = c := h2"
+    )
+
+
+def test_statement_proof_wraps_term_containing_by():
+    decl = _decl(
+        name="t", full_name="t", proof="foo (by simp) (by omega)"
+    )
+    out = _statement_proof(_level(decl), {})
+    assert out == "by\n  exact foo (by simp) (by omega)"
+
+
+def test_statement_proof_missing_proof_is_error():
+    decl = _decl(name="t", full_name="t", proof=None)
+    with pytest.raises(GenerationError, match="no proof"):
+        _statement_proof(_level(decl), {})
+
+
+def test_statement_proof_col0_comment_keeps_tactic_indent():
+    decl = _decl(
+        name="t", full_name="t",
+        signature=": 0 = 0",
+        proof="by\n  apply foo\n  exact bar\n-- trailing comment",
+    )
+    out = _statement_proof(_level(decl), {})
+    assert out == "by\n  apply foo\n  exact bar\n  -- trailing comment"
+
+
+def test_statement_proof_block_comment_keeps_tactic_indent():
+    decl = _decl(
+        name="t", full_name="t",
+        signature=": 0 = 0",
+        proof="by\n  apply foo\n/- multi\nline -/\n  exact bar",
+    )
+    out = _statement_proof(_level(decl), {})
+    assert out == "by\n  apply foo\n  /- multi\n  line -/\n  exact bar"
+
+
+def test_term_proof_inventory_uses_normalized_exact():
+    """A term proof contributes its references to `new_theorems`/`new_tactics`
+    through the same `exact` normalization used for rendering."""
+    helper = _theorem_node("lem:helper_lemma", 0)
+    blueprint = Blueprint(
+        nodes=[helper, _theorem_node("lem:t", 1)],
+        chapters=["Ch"],
+    )
+    decls = {
+        "helper_lemma": _decl(
+            name="helper_lemma", full_name="helper_lemma",
+            signature=": 0 = 0", proof="by rfl",
+        ),
+        "t": _decl(
+            name="t", full_name="t",
+            signature="(a : Nat) : a = a",
+            proof="helper_lemma.trans le_max_left",
+        ),
+    }
+    game = build_game(blueprint, decls, toolchain="v4.31.0", title="T")
+    level_t = game.worlds[0].levels[1]
+    assert "le_max_left" in level_t.new_theorems
+    assert "helper_lemma" not in level_t.new_theorems
 
 
 def test_context_replay_registers_instance_before_attribute_disable():
