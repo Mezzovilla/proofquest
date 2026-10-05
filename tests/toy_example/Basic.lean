@@ -1,3 +1,5 @@
+import Mathlib.Tactic
+
 namespace Toy
 
 def A (n : Nat) : Prop :=
@@ -16,11 +18,14 @@ theorem lemma2 (n : Nat) : A (n + 1) := by
 
 theorem lemma3 (n : Nat) : A n ∧ B (n + 1) := by
   have h := lemma2 (n + 1)
-  exact h
+  constructor
+  · unfold A
+    omega
+  · exact h
 
 theorem main (n : Nat) : A n ∧ B (n + 1) := by
   constructor
   · exact lemma1 n
-  · exact lemma3 (n + 1)
+  · exact (lemma3 n).2
 
 end Toy
