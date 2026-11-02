@@ -9,14 +9,15 @@ definition nodes become staged background inventory. This guide describes
 what the current tree — the state targeted at release 0.7.0 — actually
 does, including its limits.
 
-| Step         | What it does                                                        |
-|--------------|---------------------------------------------------------------------|
-| `check`      | fast static validation of blueprint vs Lean sources (no build)      |
-| `generate`   | writes a [GameSkeleton](https://github.com/hhu-adam/GameSkeleton) game, with stricter preflight |
-| `lake build` | the real Lean compilation of the generated game — the first gate that type-checks the level proofs |
-| `serve`      | hosts the built game on localhost — no lean4game clone needed       |
+| Step              | What it does                                                        |
+|-------------------|---------------------------------------------------------------------|
+| `blueprint build` | optional LeanArchitect extraction from annotated Lean sources       |
+| `check`           | fast static validation of blueprint vs Lean sources (no build)      |
+| `generate`        | writes a [GameSkeleton](https://github.com/hhu-adam/GameSkeleton) game, with stricter preflight |
+| `lake build`      | the real Lean compilation of the generated game — the first gate that type-checks the level proofs |
+| `serve`           | hosts the built game on localhost — no lean4game clone needed       |
 
-These are four distinct gates — success at one does not certify success at
+These are distinct gates — success at one does not certify success at
 the next. Nor is any of this automatic formalization: LaTeX proofs are
 rendered as in-game hints only, never the source of the Lean proofs, and no
 step verifies LaTeX prose or mathematics against the Lean development.
@@ -35,34 +36,33 @@ claim is an environment (`definition`, `lemma`, `theorem`, `proposition`,
   does not replace the binding. Definition environments may map several
   declarations with `\lean{A,B}`; every member must resolve.
 - `\uses{a, b}` — dependency edges (they drive the level ordering); and
-- a `proof` environment placed adjacent and at top level right after the
-  claim — its LaTeX becomes the in-game hint (optional; not a Lean proof
-  source).
+- a `proof` environment either nested in the claim or placed immediately after
+  it at top level — its LaTeX becomes the in-game hint (optional; not a Lean
+  proof source).
 
 `\input{...}` is followed recursively up to a nesting depth of 10. The
 argument must be a literal path, and every `\input` path is resolved
 relative to the **selected entry file's parent** directory — not relative
 to each included file. Comments are stripped. There is no general TeX
 expansion: `\include`, custom environments, starred theorem-style aliases,
-nested-brace titles and macros are not generally supported. Unsupported
-environments are currently **silently ignored**: `check` can exit 0 with no
-warning that claims were dropped — a fully unrecognized source produces
-zero nodes and still exits 0 — though unrelated optional-metadata warnings
-may still print. Coverage warnings are tracked in
-[#32](https://github.com/Mezzovilla/proofquest/issues/32).
+nested-brace titles and macros are not generally supported. Active `\lean` or
+`\uses` bindings outside supported nodes produce coverage warnings in `check`
+and block `generate`; comments do not count as active bindings. A source with
+no supported nodes is also diagnosed rather than accepted silently.
 
-Optional: `blueprint/lean_decls` (one declaration name per line) for a
-cross-check, and `blueprint/web/` (from `leanblueprint web`) — its presence
-only silences the "not built" warning; it enables no extra validation today.
+Optional: `blueprint/lean_decls` (one declaration name per line) provides an
+additional registry cross-check. `blueprint/web/` and `blueprint/print/` are
+rendered artifacts only; their presence does not enable extra validation.
 
 ## Prerequisites
 
-| Step         | Needs                                                                 |
-|--------------|-----------------------------------------------------------------------|
-| `check`      | Python ≥ 3.12 + [uv](https://docs.astral.sh/uv/)                       |
-| `generate`   | same (no Lean needed — the game is generated textually)                |
-| `lake build` | [elan](https://github.com/leanprover/elan) (fetches the pinned game toolchain automatically) |
-| `serve`      | modern games: system Node.js + npm (first run only) plus `lake`/`elan`; legacy v4.7 games: `lake`/`elan` — a private Node 22.17.0 is provisioned in the cache |
+| Step              | Needs                                                                 |
+|-------------------|-----------------------------------------------------------------------|
+| `blueprint build` | Lake/Lean plus a locally available, exactly pinned LeanArchitect checkout |
+| `check`           | Python ≥ 3.12 + [uv](https://docs.astral.sh/uv/)                       |
+| `generate`        | same (no Lean needed — the game is generated textually)                |
+| `lake build`      | [elan](https://github.com/leanprover/elan) (fetches the pinned game toolchain automatically) |
+| `serve`           | modern games: system Node.js + npm (first run only) plus `lake`/`elan`; legacy v4.7 games: `lake`/`elan` — a private Node 22.17.0 is provisioned in the cache |
 
 ### Get proofquest
 
@@ -89,7 +89,10 @@ checkout. See the [package README](../README.md) and
 ## Workflow
 
 ```bash
-# 1. validate blueprint x Lean sources (static only)
+# Optional: materialize blueprint/ from LeanArchitect annotations
+uv run proofquest blueprint build /path/to/project
+
+# 1. validate Blueprint x Lean sources (static only)
 uv run proofquest check /path/to/project
 
 # 2. generate the game
@@ -168,11 +171,10 @@ Current limits worth knowing up front:
   split the group into separate definition nodes with their own labels,
   `\lean{...}` bindings and `\uses` edges. Several `\lean` macros in the same
   node do not split the group; never drop members to silence warnings.
-- **Nested `proof` environments are unsafe today**
-  ([#31](https://github.com/Mezzovilla/proofquest/issues/31)). A `proof`
-  nested inside another claim's body can attach its `\uses` and hint to the
-  previous claim and even produce a spurious self-cycle error in `check`.
-  Keep every `proof` adjacent at top level until this is fixed.
+- A nested `proof` belongs exclusively to its containing claim. A top-level
+  sibling proof is attached only when it is immediately adjacent to the
+  preceding claim; detached or duplicate proofs are diagnosed instead of
+  being assigned to a distant node.
 - `\uses` is parsed as graph edges; the *proof's* dependencies are not
   semantically validated against it.
 - Additional Lean references inside a node still matter for ordering and
@@ -202,19 +204,17 @@ guard that everything accepted textually compiles.
 declaration, `\label`/`\input` parse errors, `\uses` referencing unknown
 labels, cycles in the explicit `\uses` graph — and **warnings**: missing
 `\lean{}` on definition *and* theorem-like nodes, `blueprint/lean_decls`
-drift or absence, missing `blueprint/web`. Exit code is 1 on errors, **0
+drift or absence, and parser coverage issues. Exit code is 1 on errors, **0
 with warnings**. Those warnings are metadata diagnostics, not a readiness
-score — `check` can miss real blockers with no specific warning (richer
-artifact diagnostics are tracked in
-[#33](https://github.com/Mezzovilla/proofquest/issues/33)). It is not a
+score — `check` can still miss real generation blockers. It is not a
 generation-ready certification
 ([#29](https://github.com/Mezzovilla/proofquest/issues/29)): `generate` adds
 a stricter preflight covering unsupported project-local source context
 (`set_option`, custom syntax), emission-order cycles introduced by grouped
 members or copied definitions, and a level target with no proof to reuse as
 the sample solution. `generate` is itself still incomplete — roles,
-multiple bindings on theorem-like nodes and empty/unsupported claims are
-not fully checked — so `lake build` remains the real gate. There are no
+multiple bindings on theorem-like nodes are not fully checked — so `lake
+build` remains the real gate. There are no
 `--for-game`, `--strict` or `--fix` flags — fixes belong in the sources.
 
 ## Command options
@@ -230,8 +230,19 @@ deterministically: `content.tex` > `web.tex` > `print.tex` > `main.tex`,
 looked up under `blueprint/src/` first and then `blueprint/` itself
 (`src/content.tex` is always preferred). No match — or the same
 non-`content.tex` name in both places — is an error asking for an explicit
-`.tex` file. Whatever the form, Lean scanning and the `blueprint/lean_decls` /
-`blueprint/web` checks are always rooted at the enclosing project.
+`.tex` file. Whatever the form, Lean scanning and the optional
+`blueprint/lean_decls` check are always rooted at the enclosing project.
+
+### `proofquest blueprint build PROJECT [--force]`
+
+Reads `PROJECT/proofquest.toml`, builds the configured Lean library's
+LeanArchitect facet, extracts the configured modules in their listed order,
+and publishes source-only artifacts under `PROJECT/blueprint/`. The command
+requires an exact Git revision in `lake-manifest.json` and the matching package
+checkout to be present; it never runs `lake update`. Two independent
+extractions must be byte-identical before publication. A manifest protects
+managed files from accidental replacement; `--force` overrides that protection
+without touching unrelated PDF, web or static files.
 
 ### `proofquest generate TARGET -o GAME_DIR`
 
@@ -293,8 +304,8 @@ workaround.
 - **`\lean{X} not found`** — the declaration must exist verbatim as a
   top-level declaration in the supported syntax.
 - **`\uses references unknown labels` / `cycle detected`** — fix the labels;
-  a spurious self-cycle plus misplaced hints is the signature of a `proof`
-  nested inside another claim — move it out.
+  nested and adjacent sibling proofs are supported, while detached proofs are
+  reported explicitly.
 - **unsupported-context error from `generate`** — a module defines
   project-local commands the generated level files cannot reproduce; expand
   the syntax or move the declaration to a module without such context.

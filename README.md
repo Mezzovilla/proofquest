@@ -8,7 +8,9 @@ projects.
 Given a Lean project with a `blueprint/` folder, proofquest reads the
 dependency graph of the blueprint (`\uses{...}`) and produces a game where the
 player proves the theorems of the project, guided by hints extracted from the
-LaTeX write-up.
+LaTeX write-up. Projects using
+[LeanArchitect](https://github.com/hanwenzhu/LeanArchitect) can first generate
+those Blueprint sources directly from annotations in their Lean code.
 
 > **New to proofquest?** The end-to-end guide for any leanblueprint project —
 > check, generate, build, serve — lives in
@@ -35,6 +37,40 @@ LaTeX write-up.
 
 ## Usage
 
+### Generate a Blueprint with LeanArchitect
+
+Add LeanArchitect to the Lean project's Lake dependencies, pin it to an exact
+Git commit, annotate the selected modules, and create `proofquest.toml` in the
+project root:
+
+```toml
+[blueprint]
+provider = "leanarchitect"
+library = "MyProject"
+modules = [
+  "MyProject.Definitions",
+  "MyProject.MainTheorem",
+]
+```
+
+The module list is required and is also the editorial order. With the Lake
+dependencies already present locally, generate the source artifacts:
+
+```bash
+uv run proofquest blueprint build /path/to/project
+```
+
+The command runs the pinned LeanArchitect extraction twice in isolated staging
+directories and publishes only byte-identical results. It manages
+`blueprint/src/content.tex`, `blueprint/lean_decls`, `blueprint/SHA256SUMS` and
+`blueprint/.proofquest-leanarchitect.json`; PDF and web rendering are not part
+of this command. Existing manual or edited managed files are protected. Use
+`--force` only after reviewing them. Other files under `blueprint/` are left
+untouched. The command never runs `lake update`, and `check`/`generate` never
+invoke this build implicitly.
+
+### Validate and generate the game
+
 Validate the blueprint against the Lean sources. The `check` and `generate`
 target may be the project root, its `blueprint/` directory, or an explicit
 `.tex` entry point inside `blueprint/`:
@@ -59,7 +95,7 @@ directory, it picks the entry point deterministically: `content.tex`,
 first, then `blueprint/` itself (`src/content.tex` always wins). If no
 conventional name exists, or the same non-`content.tex` name exists in both
 places, the command fails and asks for an explicit `.tex` file. Whatever the
-form, the Lean scan, the `blueprint/lean_decls` / `blueprint/web` checks, the
+form, the Lean scan, the optional `blueprint/lean_decls` cross-check, the
 default game title and the `lean-toolchain` are all read from the enclosing
 project root. `serve` takes a generated game directory instead and performs
 no blueprint resolution.

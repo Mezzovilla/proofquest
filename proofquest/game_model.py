@@ -35,6 +35,7 @@ class Blueprint:
     nodes: list[BlueprintNode]
     chapters: list[str]
     chapter_intros: dict[str, str] = field(default_factory=dict)
+    parse_issues: list[str] = field(default_factory=list)
 
     def by_label(self) -> dict[str, BlueprintNode]:
         return {n.label: n for n in self.nodes}

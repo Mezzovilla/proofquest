@@ -85,3 +85,86 @@ def test_input_resolution(tmp_path):
     )
     blueprint = parse_blueprint(write_content(tmp_path, "\\chapter{C}\n\\input{part}\n"))
     assert [n.label for n in blueprint.nodes] == ["lem:sub"]
+
+
+def test_nested_proof_belongs_only_to_its_own_node(tmp_path):
+    text = r"""
+\chapter{Example}
+\begin{lemma}\label{lem:a}\lean{a}
+  A.
+\end{lemma}
+\begin{lemma}\label{lem:b}\lean{b}
+  B.
+  \begin{proof}\uses{lem:a}
+    Proof of B.
+  \end{proof}
+\end{lemma}
+"""
+    blueprint = parse_blueprint(write_content(tmp_path, text))
+    first, second = blueprint.nodes
+    assert first.proof_tex is None
+    assert first.uses == []
+    assert second.proof_tex == "\\uses{lem:a}\n    Proof of B."
+    assert second.uses == ["lem:a"]
+    assert blueprint.parse_issues == []
+
+
+def test_successive_nested_proofs_do_not_leak(tmp_path):
+    text = r"""
+\begin{lemma}\label{a}A.\begin{proof}Proof A.\end{proof}\end{lemma}
+\begin{lemma}\label{b}B.\begin{proof}\uses{a}Proof B.\end{proof}\end{lemma}
+"""
+    blueprint = parse_blueprint(write_content(tmp_path, text))
+    assert [node.proof_tex for node in blueprint.nodes] == ["Proof A.", "\\uses{a}Proof B."]
+    assert [node.uses for node in blueprint.nodes] == [[], ["a"]]
+
+
+def test_sibling_proof_must_be_adjacent(tmp_path):
+    text = r"""
+\begin{lemma}\label{a}A.\end{lemma}
+Editorial text.
+\begin{proof}Detached proof.\end{proof}
+"""
+    blueprint = parse_blueprint(write_content(tmp_path, text))
+    assert blueprint.nodes[0].proof_tex is None
+    assert any("not adjacent" in issue for issue in blueprint.parse_issues)
+
+
+def test_unconsumed_binding_in_unsupported_environment_is_reported(tmp_path):
+    text = r"""
+\chapter{Example}
+\begin{claim}\label{custom}\lean{target}
+  A custom claim.
+\end{claim}
+"""
+    blueprint = parse_blueprint(write_content(tmp_path, text))
+    assert blueprint.nodes == []
+    assert any("unsupported claim" in issue for issue in blueprint.parse_issues)
+    assert any("no supported formal nodes" in issue for issue in blueprint.parse_issues)
+
+
+def test_unconsumed_binding_is_reported_in_mixed_blueprint(tmp_path):
+    text = r"""
+\begin{lemma}\label{supported}\lean{one}One.\end{lemma}
+\begin{claim}\label{custom}\lean{two}Two.\end{claim}
+"""
+    blueprint = parse_blueprint(write_content(tmp_path, text))
+    assert [node.label for node in blueprint.nodes] == ["supported"]
+    assert any("\\lean{two}" in issue for issue in blueprint.parse_issues)
+
+
+def test_proof_before_first_node_is_reported(tmp_path):
+    text = r"""
+\begin{proof}Orphan.\end{proof}
+\begin{lemma}\label{later}Later.\end{lemma}
+"""
+    blueprint = parse_blueprint(write_content(tmp_path, text))
+    assert blueprint.nodes[0].proof_tex is None
+    assert any("no preceding" in issue for issue in blueprint.parse_issues)
+
+
+def test_commented_binding_is_not_a_coverage_issue(tmp_path):
+    blueprint = parse_blueprint(
+        write_content(tmp_path, "% \\lean{ghost}\nSome editorial text.\n")
+    )
+    assert not any("ghost" in issue for issue in blueprint.parse_issues)
