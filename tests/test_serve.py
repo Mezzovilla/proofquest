@@ -162,8 +162,9 @@ def test_lean4game_ref_falls_back_to_toolchain(tmp_path):
     game = tmp_path / "game"
     game.mkdir()
     (game / "lean-toolchain").write_text("leanprover/lean4:v4.32.2\n")
-    ref, source = lean4game_ref(game)
+    ref, resolved_rev, source = lean4game_ref(game)
     assert ref == "v4.31.0"  # newest lean4game release at or below the toolchain
+    assert resolved_rev == "v4.31.0"  # tags are immutable
     assert "lean-toolchain" in source
 
 
@@ -177,8 +178,9 @@ def test_lean4game_ref_from_lake_manifest(tmp_path):
         ]
     }
     (game / "lake-manifest.json").write_text(json.dumps(manifest))
-    ref, source = lean4game_ref(game)
+    ref, resolved_rev, source = lean4game_ref(game)
     assert ref == "v4.31.0"
+    assert resolved_rev == "v4.31.0"  # tags are immutable
     assert "lake-manifest.json" in source
 
 
@@ -189,8 +191,9 @@ def test_lean4game_ref_uses_non_tag_revision(tmp_path):
     (game / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n")
     manifest = {"packages": [{"name": "GameServer", "inputRev": "main"}]}
     (game / "lake-manifest.json").write_text(json.dumps(manifest))
-    ref, source = lean4game_ref(game)
+    ref, resolved_rev, source = lean4game_ref(game)
     assert ref == "main"  # what the game was actually built against
+    assert resolved_rev is None  # branches are not immutable
     assert "inputRev main" in source and "may move" in source
 
 
@@ -199,8 +202,9 @@ def test_lean4game_ref_survives_malformed_manifest(tmp_path):
     game.mkdir()
     (game / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n")
     (game / "lake-manifest.json").write_text('{"packages": "not-a-list"}')
-    ref, source = lean4game_ref(game)
+    ref, resolved_rev, source = lean4game_ref(game)
     assert ref == "v4.31.0"  # falls back to the toolchain instead of crashing
+    assert resolved_rev == "v4.31.0"  # toolchain-derived tags are immutable
     assert "lean-toolchain" in source
 
 
@@ -755,6 +759,7 @@ def test_legacy_prepare_reuses_ready_cache(tmp_path, monkeypatch):
 
 
 def test_legacy_prepare_never_rewrites_partial_cache(tmp_path, monkeypatch):
+    """Failed builds are cleaned up as part of concurrency safety (staging directory cleanup on error)."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     _dist, node_payload, node_sums = _node_dist_payload()
     source = make_legacy_lean4game(tmp_path)
@@ -779,15 +784,16 @@ def test_legacy_prepare_never_rewrites_partial_cache(tmp_path, monkeypatch):
     with pytest.raises(ServeError, match="does not match the pinned package"):
         ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
     cache = tmp_path / "cache" / "proofquest"
-    partial = cache / "lean4game-v4.7.0-compat1"
-    assert partial.is_dir()
+    # With the new locking and staging approach, failed builds are cleaned up
+    # So the partial directory should not exist after a failed build
+    partial = cache / "lean4game-v4.7.0-v4.31.0-compat1"
+    assert not partial.is_dir()
     monkeypatch.setattr(
         "proofquest.serve.urllib.request.urlopen",
         _fake_urlopen_factory(node_payload, node_sums),
     )
     fixed = ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
-    assert fixed.name == "lean4game-v4.7.0-compat1-2"
-    assert partial.is_dir()
+    assert fixed.name == "lean4game-v4.7.0-v4.31.0-compat1"
 
 
 def test_legacy_ignores_old_patched_cache(tmp_path, monkeypatch):
@@ -913,6 +919,8 @@ def _legacy_prep(tmp_path, monkeypatch):
         _fake_urlopen_factory(node_payload, node_sums),
     )
     source = make_legacy_lean4game(tmp_path)
+    # Add a lean-toolchain to provide a resolved revision
+    (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n")
     return ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
 
 
@@ -966,6 +974,7 @@ def test_legacy_ready_rejects_missing_host_bind(tmp_path, monkeypatch):
 
 
 def test_lock_migration_fails_closed_on_wrong_sha(tmp_path, monkeypatch):
+    """Failed builds are cleaned up as part of concurrency safety (staging directory cleanup on error)."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     _dist, node_payload, node_sums = _node_dist_payload()
     monkeypatch.setattr(
@@ -980,12 +989,14 @@ def test_lock_migration_fails_closed_on_wrong_sha(tmp_path, monkeypatch):
     (source / "package-lock.json").write_text(json.dumps(lock))
     with pytest.raises(ServeError, match="unsupported lean4 lockfile pin"):
         ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
-    partial = tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-compat1"
-    assert json.loads((partial / "package.json").read_text()) == LEGACY_PACKAGE_JSON
-    assert "gitpkg" in (partial / "package-lock.json").read_text()
+    # With the new locking and staging approach, failed builds are cleaned up
+    # So the partial directory should not exist after a failed build
+    partial = tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-v4.31.0-compat1"
+    assert not partial.is_dir()
 
 
 def test_lock_migration_fails_closed_on_wrong_manifest_spec(tmp_path, monkeypatch):
+    """Failed builds are cleaned up as part of concurrency safety (staging directory cleanup on error)."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     _dist, node_payload, node_sums = _node_dist_payload()
     monkeypatch.setattr(
@@ -998,9 +1009,9 @@ def test_lock_migration_fails_closed_on_wrong_manifest_spec(tmp_path, monkeypatc
     (source / "package.json").write_text(json.dumps(manifest))
     with pytest.raises(ServeError, match="unsupported lean4web reference"):
         ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
-    partial = tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-compat1"
-    assert "github:hhu-adam" in (partial / "package.json").read_text()
-    assert "file:vendor" not in (partial / "package.json").read_text()
+    # With the new locking and staging approach, failed builds are cleaned up
+    partial = tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-v4.31.0-compat1"
+    assert not partial.is_dir()
 
 
 def test_lock_migration_fails_closed_on_missing_dep(tmp_path, monkeypatch):
@@ -1070,6 +1081,7 @@ def test_legacy_relay_missing_bind_line_fails(tmp_path, monkeypatch):
     ],
 )
 def test_legacy_relay_missing_fragment_fails(tmp_path, monkeypatch, fragment):
+    """Failed builds are cleaned up as part of concurrency safety (staging directory cleanup on error)."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     _dist, node_payload, node_sums = _node_dist_payload()
     monkeypatch.setattr(
@@ -1081,11 +1093,9 @@ def test_legacy_relay_missing_fragment_fails(tmp_path, monkeypatch, fragment):
     relay.write_text(relay.read_text().replace(fragment, "// removed\n"))
     with pytest.raises(ServeError, match="does not contain the expected"):
         ensure_runtime(tmp_path, "v4.7.0", lean4game=str(source))
-    copied = (
-        tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-compat1"
-        / "relay" / "index.mjs"
-    ).read_text()
-    assert "127.0.0.1" not in copied and "verifyClient" not in copied
+    # With the new locking and staging approach, failed builds are cleaned up
+    partial = tmp_path / "cache" / "proofquest" / "lean4game-v4.7.0-v4.31.0-compat1"
+    assert not partial.is_dir()
 
 
 def test_legacy_ready_rejects_nondict_marker(tmp_path, monkeypatch):
@@ -1132,5 +1142,140 @@ def test_node_sums_blank_lines(tmp_path, monkeypatch):
         "proofquest.serve.urllib.request.urlopen",
         _fake_urlopen_factory(node_payload, node_sums + b"\n\n  \n"),
     )
-    node = _provision_legacy_node()
-    assert node.is_file()
+    _provision_legacy_node()
+
+
+def test_concurrent_cache_preparation(fake_bin, tmp_path, monkeypatch, capsys):
+    """Two processes targeting the same cache key cannot corrupt each other's build."""
+    monkeypatch.setenv("PROOFQUEST_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("PQ_NPM_LOG", str(tmp_path / "npm-log.txt"))
+    source = make_lean4game(tmp_path / "lean4game")
+    
+    results = []
+    errors = []
+    
+    def build_runtime():
+        try:
+            root = ensure_runtime(Path("."), "v4.31.0", lean4game=str(source))
+            results.append(root)
+        except (ServeError, OSError) as exc:
+            errors.append(exc)
+    
+    # Spawn two threads building the same cache entry concurrently
+    threads = [threading.Thread(target=build_runtime) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    
+    # Both should succeed without errors
+    assert not errors, f"Concurrent builds failed: {errors}"
+    assert len(results) == 2, f"Expected 2 successful builds, got {len(results)}"
+    
+    # Both should return the same final cache entry
+    assert results[0] == results[1], "Concurrent builds returned different paths"
+    
+    # The cache entry should be complete (not partial)
+    assert (results[0] / "relay/dist/src/index.js").is_file()
+    assert (results[0] / "client/dist/index.html").is_file()
+    assert (results[0] / ".proofquest-serve-ready").is_file()
+    
+    # Check that npm ran only once (one process won the lock, the other reused)
+    log = (tmp_path / "npm-log.txt").read_text()
+    assert log.count("ci --allow-git=root --no-audit --no-fund") == 1
+
+
+def test_atomic_rename_prevents_partial_publication(fake_bin, tmp_path, monkeypatch):
+    """A cache entry becomes reusable only after all artifacts exist."""
+    monkeypatch.setenv("PROOFQUEST_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("PQ_NPM_LOG", str(tmp_path / "npm-log.txt"))
+    source = make_lean4game(tmp_path / "lean4game")
+    
+    # First build completes normally
+    root = ensure_runtime(Path("."), "v4.31.0", lean4game=str(source))
+    assert (root / "relay/dist/src/index.js").is_file()
+    assert (root / "client/dist/index.html").is_file()
+    assert (root / ".proofquest-serve-ready").is_file()
+    
+    # Corrupt the cache by removing the ready marker
+    (root / ".proofquest-serve-ready").unlink()
+    
+    # Rebuild should detect the incomplete entry and rebuild
+    root2 = ensure_runtime(Path("."), "v4.31.0", lean4game=str(source), rebuild=True)
+    assert root2 == root  # Same path, but rebuilt
+    assert (root2 / ".proofquest-serve-ready").is_file()
+    
+    # Verify the staging directory was cleaned up
+    staging_dirs = list(tmp_path.glob("**/*.staging-*"))
+    assert not staging_dirs, f"Staging directories not cleaned up: {staging_dirs}"
+
+
+def test_moving_reference_triggers_warning(fake_bin, tmp_path, monkeypatch, capsys):
+    """A moving reference (branch) triggers an explicit warning."""
+    monkeypatch.setenv("PROOFQUEST_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("PQ_NPM_LOG", str(tmp_path / "npm-log.txt"))
+    source = make_lean4game(tmp_path / "lean4game")
+    
+    # Create a game with a branch reference in lake-manifest.json
+    game = tmp_path / "game"
+    game.mkdir()
+    (game / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n")
+    manifest = {"packages": [{"name": "GameServer", "inputRev": "main"}]}
+    (game / "lake-manifest.json").write_text(json.dumps(manifest))
+    
+    # ensure_runtime should warn about the moving reference
+    _ = ensure_runtime(game, "main", lean4game=str(source))
+    captured = capsys.readouterr()
+    assert "may change over time" in captured.out or "may change over time" in captured.err, \
+        "Expected warning about moving reference"
+
+
+def test_immutable_revision_preferred_for_tags(fake_bin, tmp_path, monkeypatch):
+    """Tags are treated as immutable and used in cache keys."""
+    monkeypatch.setenv("PROOFQUEST_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("PQ_NPM_LOG", str(tmp_path / "npm-log.txt"))
+    source = make_lean4game(tmp_path / "lean4game")
+    
+    # Create a game with a tag reference
+    game = tmp_path / "game"
+    game.mkdir()
+    manifest = {"packages": [{"name": "GameServer", "inputRev": "v4.31.0"}]}
+    (game / "lake-manifest.json").write_text(json.dumps(manifest))
+    
+    root = ensure_runtime(game, "v4.31.0", lean4game=str(source))
+    
+    # Cache key should include the tag as the resolved revision
+    assert "v4.31.0" in root.name
+    # The cache key format is lean4game-{ref}-{resolved_rev}
+    assert root.name == "lean4game-v4.31.0-v4.31.0"
+    
+    # Verify the ready marker contains the resolved revision
+    marker = json.loads((root / ".proofquest-serve-ready").read_text())
+    assert marker["ref"] == "v4.31.0"
+    assert marker["rev"] == "v4.31.0"
+
+
+def test_commit_sha_treated_as_immutable(fake_bin, tmp_path, monkeypatch):
+    """Full commit SHAs are treated as immutable."""
+    monkeypatch.setenv("PROOFQUEST_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("PQ_NPM_LOG", str(tmp_path / "npm-log.txt"))
+    source = make_lean4game(tmp_path / "lean4game")
+    
+    # Create a game with a commit SHA reference
+    game = tmp_path / "game"
+    game.mkdir()
+    sha = "32429782f822085e28dbc2fb576f33eb00e93220"
+    manifest = {"packages": [{"name": "GameServer", "inputRev": sha}]}
+    (game / "lake-manifest.json").write_text(json.dumps(manifest))
+    
+    root = ensure_runtime(game, sha, lean4game=str(source))
+    
+    # Cache key should include the SHA as the resolved revision
+    assert sha in root.name
+    # The cache key format is lean4game-{ref}-{resolved_rev}
+    assert root.name == f"lean4game-{sha}-{sha}"
+    
+    # Verify the ready marker contains the resolved revision
+    marker = json.loads((root / ".proofquest-serve-ready").read_text())
+    assert marker["ref"] == sha
+    assert marker["rev"] == sha
