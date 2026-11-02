@@ -19,6 +19,8 @@ _PROOF_RE = re.compile(r"\\begin\{proof\}(.*?)\\end\{proof\}", re.DOTALL)
 _CHAPTER_RE = re.compile(r"\\chapter\*?\{([^{}]*)\}")
 _SECTION_RE = re.compile(r"\\section\*?\{([^{}]*)\}")
 _INPUT_RE = re.compile(r"\\input\{([^{}]*)\}")
+_FORMAL_MACRO_RE = re.compile(r"\\(lean|uses)\{([^{}]*)\}")
+_ANY_ENV_RE = re.compile(r"\\begin\{([^{}]+)\}(.*?)\\end\{\1\}", re.DOTALL)
 
 
 def _strip_comments(tex: str) -> str:
@@ -50,6 +52,10 @@ def _macro_values(body: str, macro: str) -> list[str]:
     return values
 
 
+def _dedupe(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
 def _optional_title(body: str) -> str | None:
     match = re.match(r"\s*\[([^\]]*)\]", body)
     return match.group(1).strip() if match else None
@@ -77,7 +83,9 @@ def parse_blueprint(content_tex: Path) -> Blueprint:
     env_matches = list(_ENV_RE.finditer(tex))
 
     nodes: list[BlueprintNode] = []
+    parse_issues: list[str] = []
     seen_labels: set[str] = set()
+    nested_proof_spans: set[tuple[int, int]] = set()
     for order, match in enumerate(env_matches):
         kind, body = match.group(1), match.group(2)
         labels = _macro_values(body, "label")
@@ -91,7 +99,19 @@ def parse_blueprint(content_tex: Path) -> Blueprint:
             raise BlueprintError(f"duplicate \\label{{{label}}}")
         seen_labels.add(label)
 
-        proof_match = _PROOF_RE.search(body)
+        proof_matches = list(_PROOF_RE.finditer(body))
+        for proof_match in proof_matches:
+            nested_proof_spans.add(
+                (
+                    match.start(2) + proof_match.start(),
+                    match.start(2) + proof_match.end(),
+                )
+            )
+        if len(proof_matches) > 1:
+            parse_issues.append(
+                f"{label}: multiple nested proof environments are not supported"
+            )
+        proof_match = proof_matches[0] if proof_matches else None
         proof_tex = proof_match.group(1).strip() if proof_match else None
         statement_body = _PROOF_RE.sub("", body)
         title = _optional_title(body)
@@ -106,7 +126,7 @@ def parse_blueprint(content_tex: Path) -> Blueprint:
                 title=title,
                 statement_tex=statement_body.strip(),
                 proof_tex=proof_tex,
-                uses=_macro_values(body, "uses"),
+                uses=_dedupe(_macro_values(body, "uses")),
                 leanok="\\leanok" in body,
                 chapter=_current(chapters, match.start()) or "Main",
                 section=_current(sections, match.start()),
@@ -118,20 +138,65 @@ def parse_blueprint(content_tex: Path) -> Blueprint:
     # `\end{theorem}`/`\end{lemma}` (a top-level sibling environment, not nested
     # inside the statement). Attach each such proof to the environment that ends
     # immediately before it, and merge any `\uses` the proof carries.
+    attached_proof_spans: set[tuple[int, int]] = set()
     for proof_match in _PROOF_RE.finditer(tex):
+        span = proof_match.span()
+        if span in nested_proof_spans:
+            continue
         owner = None
         for idx, env_match in enumerate(env_matches):
             if env_match.end() <= proof_match.start():
                 owner = idx
             else:
                 break
-        if owner is not None:
-            proof_body = proof_match.group(1).strip()
-            if nodes[owner].proof_tex is None:
-                nodes[owner].proof_tex = proof_body
-            for use in _macro_values(proof_body, "uses"):
-                if use not in nodes[owner].uses:
-                    nodes[owner].uses.append(use)
+        if owner is None:
+            parse_issues.append("proof environment has no preceding blueprint node")
+            continue
+        between = tex[env_matches[owner].end() : proof_match.start()]
+        if between.strip():
+            parse_issues.append(
+                f"proof environment after {nodes[owner].label} is not adjacent and was not attached"
+            )
+            continue
+        if nodes[owner].proof_tex is not None:
+            parse_issues.append(
+                f"{nodes[owner].label}: multiple proof environments are not supported"
+            )
+            continue
+        proof_body = proof_match.group(1).strip()
+        nodes[owner].proof_tex = proof_body
+        nodes[owner].uses = _dedupe(
+            nodes[owner].uses + _macro_values(proof_body, "uses")
+        )
+        attached_proof_spans.add(span)
+
+    consumed_spans = [match.span() for match in env_matches] + list(attached_proof_spans)
+    unknown_envs = [
+        match
+        for match in _ANY_ENV_RE.finditer(tex)
+        if match.group(1) not in (*ENV_KINDS, "proof")
+    ]
+    for macro_match in _FORMAL_MACRO_RE.finditer(tex):
+        if any(start <= macro_match.start() and macro_match.end() <= end for start, end in consumed_spans):
+            continue
+        macro = f"\\{macro_match.group(1)}{{{macro_match.group(2)}}}"
+        enclosing = next(
+            (
+                match.group(1)
+                for match in unknown_envs
+                if match.start() <= macro_match.start() < match.end()
+            ),
+            None,
+        )
+        context = f" inside unsupported {enclosing} environment" if enclosing else ""
+        parse_issues.append(
+            f"unconsumed formal binding {macro}{context}; only "
+            + ", ".join(ENV_KINDS)
+            + " environments are parsed"
+        )
+
+    if not nodes:
+        parse_issues.append("selected blueprint contains no supported formal nodes")
 
     chapter_titles = [title for _, title in chapters] or ["Main"]
 
@@ -149,4 +214,9 @@ def parse_blueprint(content_tex: Path) -> Blueprint:
         next_boundary = min(b for b in boundaries if b > match.start() and b >= end_of_macro)
         chapter_intros[match.group(1)] = tex[end_of_macro:next_boundary].strip()
 
-    return Blueprint(nodes=nodes, chapters=chapter_titles, chapter_intros=chapter_intros)
+    return Blueprint(
+        nodes=nodes,
+        chapters=chapter_titles,
+        chapter_intros=chapter_intros,
+        parse_issues=_dedupe(parse_issues),
+    )

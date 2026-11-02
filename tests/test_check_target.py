@@ -293,3 +293,55 @@ def test_generate_root_content_tex_still_works(tmp_path):
     assert main(["generate", str(project), "-o", str(game)]) == 0
     assert (game / "Game.lean").exists()
     assert any(stem.endswith("_foo.lean") for stem in _level_stems(game))
+
+
+def test_partial_parser_coverage_warns_in_check_and_blocks_generate(tmp_path, capsys):
+    project = make_project(tmp_path)
+    (project / "Basic.lean").write_text(
+        "theorem target : True := by\n  trivial\n", encoding="utf-8"
+    )
+    (project / "blueprint/src/content.tex").write_text(
+        "\\chapter{Example}\n"
+        "\\begin{claim}\\label{custom}\\lean{target}\n"
+        "  A custom claim.\n\\end{claim}\n",
+        encoding="utf-8",
+    )
+
+    assert main(["check", str(project)]) == 0
+    err = capsys.readouterr().err
+    assert "unconsumed formal binding" in err
+    assert "unsupported claim" in err
+
+    game = tmp_path / "game"
+    assert main(["generate", str(project), "-o", str(game)]) == 1
+    assert "no supported formal nodes" in capsys.readouterr().err
+    assert not game.exists()
+
+
+def test_definition_only_blueprint_warns_for_check_and_blocks_game(tmp_path, capsys):
+    project = make_project(tmp_path)
+    (project / "Basic.lean").write_text("def value : Nat := 1\n", encoding="utf-8")
+    (project / "blueprint/src/content.tex").write_text(
+        "\\chapter{Example}\n"
+        "\\begin{definition}\\label{value}\\lean{value}\n"
+        "  A value.\n\\end{definition}\n",
+        encoding="utf-8",
+    )
+    assert main(["check", str(project)]) == 0
+    assert "no theorem-like nodes" in capsys.readouterr().err
+    game = tmp_path / "game"
+    assert main(["generate", str(project), "-o", str(game)]) == 1
+    assert "cannot produce game levels" in capsys.readouterr().err
+    assert not game.exists()
+
+
+def test_artifact_diagnostics_name_selected_entry_and_do_not_promise_web_checks(
+    tmp_path, capsys
+):
+    project = make_project(tmp_path, entry="src/print.tex")
+    (project / "blueprint/lean_decls").write_text("foo\nextra\n", encoding="utf-8")
+    assert main(["check", str(project / "blueprint/src/print.tex")]) == 0
+    err = capsys.readouterr().err
+    assert "not referenced in blueprint/src/print.tex" in err
+    assert "enable full checks" not in err
+    assert "blueprint/web not built" not in err

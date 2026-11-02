@@ -1,4 +1,4 @@
-"""Command-line interface: ``proofquest generate``, ``check`` and ``serve``."""
+"""Command-line interface for game and Blueprint workflows."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from .architect import ArchitectError, build_architect_blueprint
 from .blueprint_parser import BlueprintError, parse_blueprint
 from .dep_graph import DependencyError, topological_order
 from .generator import GenerationError, build_game, write_game
@@ -108,7 +109,9 @@ def _default_title(project_dir: Path) -> str:
 def cmd_check(args: argparse.Namespace) -> int:
     project_dir, source = _resolve_blueprint_target(Path(args.project))
     blueprint, decls = _load(project_dir, source=source)
-    errors, warnings = validate(project_dir, blueprint, decls)
+    errors, warnings = validate(
+        project_dir, blueprint, decls, entry_point=source, for_game=False
+    )
     try:
         order = topological_order(blueprint)
     except DependencyError as exc:
@@ -126,7 +129,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
     project_dir, source = _resolve_blueprint_target(Path(args.project))
     output_dir = Path(args.output)
     blueprint, decls = _load(project_dir, (output_dir,), source=source)
-    errors, warnings = validate(project_dir, blueprint, decls)
+    errors, warnings = validate(
+        project_dir, blueprint, decls, entry_point=source, for_game=True
+    )
 
     toolchain_file = project_dir / "lean-toolchain"
     project_toolchain = (
@@ -158,6 +163,15 @@ def cmd_generate(args: argparse.Namespace) -> int:
     print(f"generated {len(written)} files in {args.output}")
     for path in written:
         print(f"  {path.relative_to(args.output)}")
+    return 0
+
+
+def cmd_blueprint_build(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project)
+    written = build_architect_blueprint(project_dir, force=args.force)
+    print(f"generated {len(written)} Blueprint files in {project_dir / 'blueprint'}")
+    for path in written:
+        print(f"  {path.relative_to(project_dir.resolve())}")
     return 0
 
 
@@ -221,10 +235,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     srv.set_defaults(func=cmd_serve)
 
+    blueprint = sub.add_parser(
+        "blueprint",
+        help="build Blueprint sources from an annotated Lean project",
+    )
+    blueprint_sub = blueprint.add_subparsers(dest="blueprint_command", required=True)
+    blueprint_build = blueprint_sub.add_parser(
+        "build",
+        help="generate blueprint/ from LeanArchitect annotations",
+    )
+    blueprint_build.add_argument(
+        "project",
+        help="path to a Lean project containing proofquest.toml",
+    )
+    blueprint_build.add_argument(
+        "--force",
+        action="store_true",
+        help="replace only ProofQuest-managed Blueprint files even if modified",
+    )
+    blueprint_build.set_defaults(func=cmd_blueprint_build)
+
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (BlueprintError, DependencyError, GenerationError, ServeError) as exc:
+    except (
+        ArchitectError,
+        BlueprintError,
+        DependencyError,
+        GenerationError,
+        ServeError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
