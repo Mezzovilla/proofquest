@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import gzip
 import hashlib
 import io
@@ -30,6 +31,7 @@ import tarfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -141,11 +143,27 @@ _LEGACY_VENDOR_PINS = (
 )
 
 
+@contextmanager
+def _cache_lock(lock_path: Path):
+    """Context manager for file-based cache entry locking.
+    
+    Uses fcntl.flock on Unix for file locking (Unix-only).
+    The lock file is created if it doesn't exist.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 class ServeError(Exception):
     """Raised when the game cannot be served; the message is user-facing."""
 
 
-def lean4game_ref(game_dir: Path) -> tuple[str, str]:
+def lean4game_ref(game_dir: Path) -> tuple[str, str | None, str]:
     """Return the lean4game ref (tag, branch or commit) the game was built against.
 
     The ref must match the game's toolchain so the served client/relay speak
@@ -154,6 +172,11 @@ def lean4game_ref(game_dir: Path) -> tuple[str, str]:
     possible, otherwise the branch/commit it names (used as-is for downloads,
     with a warning since it may move); without a manifest, fall back to the
     toolchain rule shared with ``generate``.
+    
+    Returns:
+        (ref, resolved_rev, source_note): ref is the tag/branch/commit name,
+        resolved_rev is the immutable SHA if available (for tags and commits),
+        source_note explains where the ref came from.
     """
     manifest = game_dir / "lake-manifest.json"
     if manifest.exists():
@@ -163,10 +186,15 @@ def lean4game_ref(game_dir: Path) -> tuple[str, str]:
             rev = entry.get("inputRev")
             if isinstance(rev, str) and rev:
                 if _TAG_RE.match(rev):
-                    return rev, f"lake-manifest.json (GameServer inputRev {rev})"
-                return rev, (
+                    # Tags are immutable; use the tag itself as the resolved revision
+                    return rev, rev, f"lake-manifest.json (GameServer inputRev {rev})"
+                if _SHA_RE.fullmatch(rev):
+                    # Full commit SHA is already immutable
+                    return rev, rev, f"lake-manifest.json (GameServer inputRev {rev})"
+                # Branch or short SHA: may move, warn and return None for resolved_rev
+                return rev, None, (
                     f"lake-manifest.json (GameServer inputRev {rev}; not a release "
-                    "tag, so it may move — prefer a v4.X.0 tag when rebuilding)"
+                    "tag or commit SHA, so it may move — prefer a v4.X.0 tag when rebuilding)"
                 )
         except (OSError, ValueError, KeyError, TypeError, AttributeError, StopIteration):
             pass
@@ -177,7 +205,9 @@ def lean4game_ref(game_dir: Path) -> tuple[str, str]:
         else None
     )
     pinned, _warning = game_toolchain(toolchain)
-    return "v" + pinned.split(":v", 1)[1], f"lean-toolchain ({toolchain or 'missing'})"
+    tag = "v" + pinned.split(":v", 1)[1]
+    # Toolchain-derived tags are immutable
+    return tag, tag, f"lean-toolchain ({toolchain or 'missing'})"
 
 
 def game_name(game_dir: Path) -> str:
@@ -313,9 +343,18 @@ def _run(cmd: list[str], cwd: Path, env: dict[str, str]) -> None:
         ) from exc
 
 
-def _cache_key(ref: str, rev: str | None) -> str:
+def _cache_key(ref: str, resolved_rev: str | None) -> str:
+    """Generate a cache key from ref and optional resolved revision.
+    
+    When resolved_rev is available (from lake-manifest.json inputRev for tags/commits
+    or from _package_rev for lake-fetched packages), it is used to ensure the cache
+    key is stable even if the ref is a moving branch. When not available, the ref
+    alone is used (with a warning at the call site for moving references).
+    """
     safe = re.sub(r"[^\w.-]+", "-", ref)
-    return f"lean4game-{safe}-{rev}" if rev else f"lean4game-{safe}"
+    if resolved_rev:
+        return f"lean4game-{safe}-{resolved_rev}"
+    return f"lean4game-{safe}"
 
 
 def _relay_entry(root: Path) -> Path:
@@ -713,97 +752,142 @@ def _legacy_ready(root: Path, ref: str, rev: str | None) -> bool:
 
 
 def _ensure_legacy_runtime(
-    source: Path, ref: str, rev: str | None, rebuild: bool
+    source: Path, ref: str, resolved_rev: str | None, rebuild: bool
 ) -> Path:
     """Prepare (once) the reproducible GameServer v4.7 runtime: pinned Node
     v22.17.0, vendored pins replacing the dead gitpkg deps, ``npm ci``, and
     the root ``build_client`` vite build. Never rewrites an existing cache
     entry: a stale or partial one is left in place and a fresh suffixed
-    directory is used instead."""
-    key = _cache_key(ref, rev) + f"-{_LEGACY_COMPAT}"
+    directory is used instead.
+    
+    Uses file locking to prevent concurrent processes from corrupting each other's
+    build directories. Builds in a staging directory and publishes atomically via rename.
+    """
+    key = _cache_key(ref, resolved_rev) + f"-{_LEGACY_COMPAT}"
     base = cache_root() / key
+    lock_path = cache_root() / f"{key}.lock"
+    
+    # First, check if a valid cache entry already exists (without lock)
     candidate = base
     suffix = 1
     while candidate.exists():
-        if not rebuild and _legacy_ready(candidate, ref, rev):
+        if not rebuild and _legacy_ready(candidate, ref, resolved_rev):
             print(f"reusing the cached lean4game {ref} runtime: {candidate}")
             return candidate
         suffix += 1
         candidate = base.with_name(f"{base.name}-{suffix}")
-    root = candidate
-    root.mkdir(parents=True)
+    
+    # Need to build: acquire lock to prevent concurrent builds
+    with _cache_lock(lock_path):
+        # Re-check after acquiring lock - another process may have built it
+        candidate = base
+        suffix = 1
+        while candidate.exists():
+            if not rebuild and _legacy_ready(candidate, ref, resolved_rev):
+                print(f"reusing the cached lean4game {ref} runtime: {candidate}")
+                return candidate
+            suffix += 1
+            candidate = base.with_name(f"{base.name}-{suffix}")
+        
+        # For rebuild, remove the existing directory first
+        if rebuild and candidate.exists():
+            shutil.rmtree(candidate)
+        
+        # Build in a staging directory, then rename atomically
+        staging = candidate.with_name(f"{candidate.name}.staging-{os.getpid()}")
+        root = staging
+        try:
+            root.mkdir(parents=True)
+        except FileExistsError:
+            # Clean up stale staging directory from a previous failed build
+            shutil.rmtree(root, ignore_errors=True)
+            root.mkdir(parents=True)
 
-    print(f"preparing the pinned lean4game {ref} legacy runtime in {root}")
-    for name in _LEGACY_COPIED_PATHS:
-        origin = source / name
-        if origin.is_dir():
-            shutil.copytree(origin, root / name, ignore=_COPY_IGNORE)
-        elif origin.is_file():
-            shutil.copy2(origin, root / name)
-        else:
-            raise ServeError(f"the lean4game tree at {source} is missing {name}")
-    relay = root / _RELAY_ENTRY_LEGACY
-    relay_text = relay.read_text()
-    for unbound, bound in _LEGACY_RELAY_PATCHES:
-        if unbound not in relay_text:
-            raise ServeError(
-                f"the legacy relay at {relay} does not contain the expected "
-                f"{unbound.strip()!r} line; refusing to serve"
-            )
-    for unbound, bound in _LEGACY_RELAY_PATCHES:
-        relay_text = relay_text.replace(unbound, bound, 1)
-    relay.write_text(relay_text)
+        print(f"preparing the pinned lean4game {ref} legacy runtime in {root}")
+        try:
+            for name in _LEGACY_COPIED_PATHS:
+                origin = source / name
+                if origin.is_dir():
+                    shutil.copytree(origin, root / name, ignore=_COPY_IGNORE)
+                elif origin.is_file():
+                    shutil.copy2(origin, root / name)
+                else:
+                    raise ServeError(f"the lean4game tree at {source} is missing {name}")
+            relay = root / _RELAY_ENTRY_LEGACY
+            relay_text = relay.read_text()
+            for unbound, bound in _LEGACY_RELAY_PATCHES:
+                if unbound not in relay_text:
+                    raise ServeError(
+                        f"the legacy relay at {relay} does not contain the expected "
+                        f"{unbound.strip()!r} line; refusing to serve"
+                    )
+            for unbound, bound in _LEGACY_RELAY_PATCHES:
+                relay_text = relay_text.replace(unbound, bound, 1)
+            relay.write_text(relay_text)
 
-    node = _provision_legacy_node()
-    work = root / ".vendor-work"
-    vendor = root / "vendor"
-    lean4_spec = f"file:{(vendor / 'lean4-0.0.119.tgz').resolve()}"
-    integrities = {
-        pin.dep: _vendor_dep(
-            pin, work, vendor, lean4_spec if pin.dep == "lean4web" else None
-        )
-        for pin in _LEGACY_VENDOR_PINS
-    }
-    _migrate_legacy_lock(root, integrities)
-
-    env = dict(os.environ)
-    env["PATH"] = str(node.parent) + os.pathsep + env.get("PATH", "")
-    env["CYPRESS_INSTALL_BINARY"] = "0"
-    npm = node.parent / "npm"
-    print("installing the pinned npm dependencies (npm ci, migrated lockfile)")
-    _run([str(npm), "ci", "--no-audit", "--no-fund"], root, env)
-    print("building the lean4game client (first run only)")
-    _run([str(npm), "run", "build_client"], root, env)
-    if not _is_built(root):
-        raise ServeError(
-            "the legacy client build finished but the expected artifacts are "
-            f"missing ({_CLIENT_INDEX})"
-        )
-    (root / _READY_MARKER).write_text(
-        json.dumps(
-            {
-                "ref": ref,
-                "rev": rev,
-                "compat": _LEGACY_COMPAT,
-                "node": _LEGACY_NODE_VERSION,
-                "host": "127.0.0.1",
-                "policy": _LEGACY_POLICY,
-                "vendor": {
-                    pin.dep: {
-                        "repo": pin.repo,
-                        "sha": pin.sha,
-                        "subdir": pin.subdir,
-                        "tarball": pin.tarball,
-                        "integrity": integrities[pin.dep],
-                    }
-                    for pin in _LEGACY_VENDOR_PINS
-                },
-                "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            node = _provision_legacy_node()
+            work = root / ".vendor-work"
+            vendor = root / "vendor"
+            lean4_spec = f"file:{(vendor / 'lean4-0.0.119.tgz').resolve()}"
+            integrities = {
+                pin.dep: _vendor_dep(
+                    pin, work, vendor, lean4_spec if pin.dep == "lean4web" else None
+                )
+                for pin in _LEGACY_VENDOR_PINS
             }
-        ),
-        encoding="utf-8",
-    )
-    return root
+            _migrate_legacy_lock(root, integrities)
+
+            env = dict(os.environ)
+            env["PATH"] = str(node.parent) + os.pathsep + env.get("PATH", "")
+            env["CYPRESS_INSTALL_BINARY"] = "0"
+            npm = node.parent / "npm"
+            print("installing the pinned npm dependencies (npm ci, migrated lockfile)")
+            _run([str(npm), "ci", "--no-audit", "--no-fund"], root, env)
+            print("building the lean4game client (first run only)")
+            _run([str(npm), "run", "build_client"], root, env)
+            if not _is_built(root):
+                raise ServeError(
+                    "the legacy client build finished but the expected artifacts are "
+                    f"missing ({_CLIENT_INDEX})"
+                )
+            (root / _READY_MARKER).write_text(
+                json.dumps(
+                    {
+                        "ref": ref,
+                        "rev": resolved_rev,
+                        "compat": _LEGACY_COMPAT,
+                        "node": _LEGACY_NODE_VERSION,
+                        "host": "127.0.0.1",
+                        "policy": _LEGACY_POLICY,
+                        "vendor": {
+                            pin.dep: {
+                                "repo": pin.repo,
+                                "sha": pin.sha,
+                                "subdir": pin.subdir,
+                                "tarball": pin.tarball,
+                                "integrity": integrities[pin.dep],
+                            }
+                            for pin in _LEGACY_VENDOR_PINS
+                        },
+                        "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            
+            # Atomic rename from staging to final location
+            try:
+                root.rename(candidate)
+            except OSError as exc:
+                # If rename fails (e.g., target now exists), clean up staging
+                shutil.rmtree(root, ignore_errors=True)
+                raise ServeError(f"failed to publish cache entry: {exc}") from exc
+            
+            return candidate
+        except Exception:
+            # Clean up staging directory on any error
+            shutil.rmtree(root, ignore_errors=True)
+            raise
 
 
 def ensure_runtime(
@@ -814,61 +898,115 @@ def ensure_runtime(
 ) -> Path:
     """Return the cached lean4game tree with the client and relay built.
 
-    The tree is pinned by ref (and revision, when known) in the cache, so a
+    The tree is pinned by ref (and resolved revision, when known) in the cache, so a
     toolchain change yields a new cache entry instead of version drift.
+    
+    Uses file locking to prevent concurrent processes from corrupting each other's
+    build directories. Builds in a staging directory and publishes atomically via rename.
+    Warns when using a moving reference (branch) without an immutable resolved revision.
     """
     source, source_note = _resolve_source(game_dir, lean4game)
-    rev = _package_rev(source) if source else None
+    # Get resolved revision from lake-fetched package if available
+    resolved_rev = _package_rev(source) if source else None
+    
+    # Get the immutable revision from lake-manifest.json if available
+    _manifest_ref, manifest_resolved, _manifest_note = lean4game_ref(game_dir)
+    # Prefer the manifest's resolved revision (it's more authoritative)
+    if manifest_resolved is not None:
+        resolved_rev = manifest_resolved
+    
+    # Warn if we're using a moving reference (no immutable revision available)
+    if resolved_rev is None and not _TAG_RE.match(ref) and not _SHA_RE.fullmatch(ref):
+        print(f"warning: using moving reference '{ref}' which may change over time; "
+              f"prefer a release tag (v4.X.0) or commit SHA for reproducible builds")
+    
     if source is not None and _legacy_runtime(source):
-        return _ensure_legacy_runtime(source, ref, rev, rebuild)
-    root = cache_root() / _cache_key(ref, rev)
+        return _ensure_legacy_runtime(source, ref, resolved_rev, rebuild)
+    
+    key = _cache_key(ref, resolved_rev)
+    root = cache_root() / key
+    lock_path = cache_root() / f"{key}.lock"
+    
+    # First, check if a valid cache entry already exists (without lock)
     if not rebuild and (root / _READY_MARKER).is_file() and _is_built(root):
         print(f"reusing the cached lean4game {ref} runtime: {root}")
         return root
-    if source is None:
-        staging = _free_dir(cache_root() / (_cache_key(ref, rev) + ".source"))
-        _download_pinned(ref, staging)
-        if _legacy_runtime(staging):
-            return _ensure_legacy_runtime(staging, ref, rev, rebuild)
-        source = staging
-        source_note = f"the downloaded lean4game {ref} tarball"
+    
+    # Need to build: acquire lock to prevent concurrent builds
+    with _cache_lock(lock_path):
+        # Re-check after acquiring lock - another process may have built it
+        if not rebuild and (root / _READY_MARKER).is_file() and _is_built(root):
+            print(f"reusing the cached lean4game {ref} runtime: {root}")
+            return root
+        
+        # For rebuild, remove the existing directory first
+        if rebuild and root.exists():
+            shutil.rmtree(root)
+        
+        if source is None:
+            staging_source = _free_dir(cache_root() / (key + ".source"))
+            _download_pinned(ref, staging_source)
+            if _legacy_runtime(staging_source):
+                return _ensure_legacy_runtime(staging_source, ref, resolved_rev, rebuild)
+            source = staging_source
+            source_note = f"the downloaded lean4game {ref} tarball"
 
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(parents=True)
-    print(f"preparing the pinned lean4game {ref} runtime in {root}")
-    print(f"  source: {source_note}")
-    for name in _COPIED_PATHS:
-        origin = source / name
-        if origin.is_dir():
-            shutil.copytree(origin, root / name, ignore=_COPY_IGNORE)
-        elif origin.is_file():
-            shutil.copy2(origin, root / name)
-        else:
-            raise ServeError(f"the lean4game tree at {source} is missing {name}")
+        # Build in a staging directory, then rename atomically
+        staging = root.with_name(f"{root.name}.staging-{os.getpid()}")
+        try:
+            staging.mkdir(parents=True)
+        except FileExistsError:
+            # Clean up stale staging directory from a previous failed build
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True)
+        
+        print(f"preparing the pinned lean4game {ref} runtime in {staging}")
+        print(f"  source: {source_note}")
+        try:
+            for name in _COPIED_PATHS:
+                origin = source / name
+                if origin.is_dir():
+                    shutil.copytree(origin, staging / name, ignore=_COPY_IGNORE)
+                elif origin.is_file():
+                    shutil.copy2(origin, staging / name)
+                else:
+                    raise ServeError(f"the lean4game tree at {source} is missing {name}")
 
-    npm = shutil.which("npm")
-    if npm is None:
-        raise ServeError("npm not found on PATH; install Node.js/npm to prepare the client")
-    env = dict(os.environ)
-    env["CYPRESS_INSTALL_BINARY"] = "0"  # the browser test runner is not needed to serve
-    print(
-        "installing the pinned npm dependencies (from package-lock.json; a download, not a clone)"
-    )
-    _run([npm, "ci", *_npm_allow_git(npm), "--no-audit", "--no-fund"], root, env)
-    print("building the lean4game relay and client (first run only)")
-    _run([npm, "run", "build:relay"], root, env)
-    _run([npm, "run", "build:client"], root, env)
-    if not _is_built(root):
-        raise ServeError(
-            "the client/relay build finished but the expected artifacts are missing "
-            f"({_RELAY_ENTRY}, {_CLIENT_INDEX})"
-        )
-    (root / _READY_MARKER).write_text(
-        json.dumps({"ref": ref, "rev": rev, "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%S")}),
-        encoding="utf-8",
-    )
-    return root
+            npm = shutil.which("npm")
+            if npm is None:
+                raise ServeError("npm not found on PATH; install Node.js/npm to prepare the client")
+            env = dict(os.environ)
+            env["CYPRESS_INSTALL_BINARY"] = "0"  # the browser test runner is not needed to serve
+            print(
+                "installing the pinned npm dependencies (from package-lock.json; a download, not a clone)"
+            )
+            _run([npm, "ci", *_npm_allow_git(npm), "--no-audit", "--no-fund"], staging, env)
+            print("building the lean4game relay and client (first run only)")
+            _run([npm, "run", "build:relay"], staging, env)
+            _run([npm, "run", "build:client"], staging, env)
+            if not _is_built(staging):
+                raise ServeError(
+                    "the client/relay build finished but the expected artifacts are missing "
+                    f"({_RELAY_ENTRY}, {_CLIENT_INDEX})"
+                )
+            (staging / _READY_MARKER).write_text(
+                json.dumps({"ref": ref, "rev": resolved_rev, "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%S")}),
+                encoding="utf-8",
+            )
+            
+            # Atomic rename from staging to final location
+            try:
+                staging.rename(root)
+            except OSError as exc:
+                # If rename fails (e.g., target now exists), clean up staging
+                shutil.rmtree(staging, ignore_errors=True)
+                raise ServeError(f"failed to publish cache entry: {exc}") from exc
+            
+            return root
+        except Exception:
+            # Clean up staging directory on any error
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
 
 def link_game(root_name: str, game_dir: Path) -> Path:
@@ -1007,7 +1145,7 @@ def serve(args: argparse.Namespace) -> int:
     if not _port_available(args.port):
         raise ServeError(f"port {args.port} is already in use; choose another with --port")
 
-    ref, ref_source = lean4game_ref(game_dir)
+    ref, _resolved_rev, ref_source = lean4game_ref(game_dir)
     print(f"proofquest serve: hosting {game_dir}")
     print(f"  lean4game artifacts pinned to {ref} (from {ref_source}; never 'latest')")
     root = ensure_runtime(game_dir, ref, lean4game=args.lean4game, rebuild=args.rebuild)
